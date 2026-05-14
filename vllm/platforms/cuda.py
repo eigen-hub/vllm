@@ -93,6 +93,7 @@ def _get_backend_priorities(
                 sparse_backends = [
                     AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
                     AttentionBackendEnum.FLASHMLA_SPARSE,
+                    AttentionBackendEnum.TRITON_MLA_SPARSE,
                 ]
             else:
                 # BF16 KV Cache
@@ -101,11 +102,13 @@ def _get_backend_priorities(
                     sparse_backends = [
                         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
                         AttentionBackendEnum.FLASHMLA_SPARSE,
+                        AttentionBackendEnum.TRITON_MLA_SPARSE,
                     ]
                 else:
                     sparse_backends = [
                         AttentionBackendEnum.FLASHMLA_SPARSE,
                         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
+                        AttentionBackendEnum.TRITON_MLA_SPARSE,
                     ]
 
             return [
@@ -123,6 +126,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHINFER_MLA,
                 AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
+                AttentionBackendEnum.TRITON_MLA_SPARSE,
             ]
     else:
         if device_capability.major == 10:

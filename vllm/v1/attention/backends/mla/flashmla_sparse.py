@@ -156,6 +156,12 @@ class DeepseekV4FlashMLASparseBackend(FlashMLASparseBackend):
     def get_name() -> str:
         return "V4_FLASHMLA_SPARSE"
 
+    @classmethod
+    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+        # DeepSeek V4 dispatches to Triton/reference kernels on SM80 while
+        # reusing this metadata/cache layout backend.
+        return capability.major in [8, 9, 10]
+
     @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
@@ -1066,8 +1072,8 @@ def build_c128a_topk_metadata(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single kernel for all C128A tokens (decode + prefill).
 
-    Decode tokens: position → block_table lookup → global slot ids + topk_lens.
-    Prefill tokens: position → local indices [0, ..., n-1, -1, ...].
+    Decode tokens: position -> block_table lookup -> global slot ids + topk_lens.
+    Prefill tokens: position -> local indices [0, ..., n-1, -1, ...].
 
     Writes into pre-allocated buffers for CUDA graph address stability.
     Returns slices of the buffers.
@@ -1130,7 +1136,7 @@ def _build_c128a_topk_metadata_kernel(
     is_decode = token_idx < num_decode_tokens
 
     if is_decode:
-        # --- Decode: block-table lookup → global slot ids + count ---
+        # --- Decode: block-table lookup -> global slot ids + count ---
         is_valid_token = tl.load(slot_mapping_ptr + token_idx) >= 0
         req_idx = tl.load(token_to_req_indices_ptr + token_idx)
         count = tl.zeros((), dtype=tl.int32)

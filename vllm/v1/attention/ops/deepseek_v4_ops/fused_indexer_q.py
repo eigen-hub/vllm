@@ -3,7 +3,9 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.deep_gemm import is_deep_gemm_supported, use_dsv4_reference_kernels
 from vllm.utils.import_utils import has_cutedsl
 
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
@@ -45,6 +47,67 @@ def _fp32x2_to_fp4x2(x_lo, x_hi):
 
 
 @triton.jit
+def _encode_e4m3fn_sw(x):
+    bits = x.to(tl.uint32, bitcast=True)
+    sign = (bits >> 31) & 1
+    abs_bits = bits & 0x7FFFFFFF
+    exp_fp32 = (abs_bits >> 23).to(tl.int32)
+    mant_fp32 = abs_bits & 0x7FFFFF
+
+    is_zero = abs_bits == 0
+    is_inf_or_nan = exp_fp32 == 0xFF
+    is_nan = is_inf_or_nan & (mant_fp32 != 0)
+
+    exp_fp8 = exp_fp32 - 120
+
+    mant_extracted = mant_fp32 >> 20
+    round_bit = (mant_fp32 >> 19) & 1
+    sticky = (mant_fp32 & 0x7FFFF) != 0
+    odd = (mant_extracted & 1) == 1
+    round_up = round_bit & (sticky.to(tl.uint32) | odd.to(tl.uint32))
+    mant_rounded = mant_extracted + round_up
+    carry = mant_rounded == 8
+    exp_after = exp_fp8 + carry.to(tl.int32)
+    mant_after = tl.where(carry, 0, mant_rounded)
+    packed_normal = ((exp_after.to(tl.uint32) & 0xF) << 3) | (mant_after & 0x7)
+
+    impl_mant = (tl.full((), 1, tl.uint32) << 23) | mant_fp32
+    sub_shift = (141 - exp_fp32).to(tl.uint32)
+    safe_shift = tl.minimum(sub_shift, 31)
+    sub_m_int = impl_mant >> safe_shift
+    sub_round_bit = tl.where(
+        safe_shift >= 1,
+        (impl_mant >> (safe_shift - 1)) & 1,
+        tl.zeros_like(impl_mant),
+    )
+    sticky_mask = tl.where(
+        safe_shift >= 2,
+        (tl.full((), 1, tl.uint32) << (safe_shift - 1)) - 1,
+        tl.zeros_like(impl_mant),
+    )
+    sub_sticky = (impl_mant & sticky_mask) != 0
+    sub_odd = (sub_m_int & 1) == 1
+    sub_round_up = sub_round_bit & (sub_sticky.to(tl.uint32) | sub_odd.to(tl.uint32))
+    sub_m_rounded = sub_m_int + sub_round_up
+    sub_promotes = sub_m_rounded == 8
+    sub_packed = tl.where(
+        sub_promotes,
+        tl.full((), 0x08, tl.uint32),
+        sub_m_rounded & 0x7,
+    )
+
+    over_max_finite = (exp_after >= 16) | ((exp_after == 15) & (mant_after == 7))
+    packed_normal = tl.where(over_max_finite, 0x7E, packed_normal)
+
+    is_subnormal = exp_fp8 <= 0
+    encoded = tl.where(is_subnormal, sub_packed, packed_normal)
+    encoded = tl.where(is_zero, tl.zeros_like(encoded), encoded)
+    encoded = tl.where(is_nan, tl.full((), 0x7F, tl.uint32), encoded)
+    encoded = encoded | (sign << 7)
+    return encoded.to(tl.uint8)
+
+
+@triton.jit
 def _quantize_mxfp4_pair(x_lo, x_hi):
     """Quantize a block of MXFP4_BLOCK_SIZE fp32 values given as two
     interleaved halves (x_lo = values at even positions in the block,
@@ -53,7 +116,7 @@ def _quantize_mxfp4_pair(x_lo, x_hi):
         - ue8m0  : scalar uint8    (block scale = 2^(ue8m0 - 127))
     """
     amax = tl.maximum(tl.max(tl.abs(x_lo)), tl.max(tl.abs(x_hi)))
-    # 6 * 2^-126 is from https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/inference/kernel.py#L163
+    # 6 * 2^-126 matches DeepSeek's reference inference kernel.
     amax = tl.maximum(amax, 6.0 * (2**-126))
     # ue8m0 block scale: 2^ceil(log2(amax/6.0)).
     log2_ratio = tl.math.ceil(tl.math.log2(amax * (1.0 / 6.0)))
@@ -64,6 +127,89 @@ def _quantize_mxfp4_pair(x_lo, x_hi):
     inv_scale = 1.0 / scale
     packed = _fp32x2_to_fp4x2(x_lo * inv_scale, x_hi * inv_scale)
     return packed, ue8m0
+
+
+@triton.jit
+def _fused_indexer_q_rope_fp8_sw_kernel(
+    pos_ptr,
+    index_q_ptr,
+    index_q_stride0,
+    index_q_stride1,
+    index_q_cos_sin_ptr,
+    index_q_cos_sin_stride,
+    INDEX_Q_HALF_ROT_DIM: tl.constexpr,
+    out_fp8_ptr,
+    out_stride0,
+    out_stride1,
+    INDEX_Q_HEAD_DIM: tl.constexpr,
+    index_weights_ptr,
+    index_weights_stride,
+    index_weights_softmax_scale,
+    index_weights_head_scale,
+    index_weights_out_ptr,
+    index_weights_out_stride,
+):
+    """SM80 variant: emit FP8 bytes without using tl.float8e4nv."""
+    INDEX_Q_ROT_DIM: tl.constexpr = 2 * INDEX_Q_HALF_ROT_DIM
+    INDEX_Q_NOPE_DIM: tl.constexpr = INDEX_Q_HEAD_DIM - INDEX_Q_ROT_DIM
+    tl.static_assert(INDEX_Q_NOPE_DIM >= 0)
+
+    tok_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    pos = tl.load(pos_ptr + tok_idx)
+    cos, sin = _get_cos_sin(
+        index_q_cos_sin_ptr,
+        index_q_cos_sin_stride,
+        pos,
+        INDEX_Q_HALF_ROT_DIM,
+    )
+    half_offset = tl.arange(0, INDEX_Q_HALF_ROT_DIM)
+    base_ptr = index_q_ptr + tok_idx * index_q_stride0 + head_idx * index_q_stride1
+
+    rot_base = base_ptr + INDEX_Q_NOPE_DIM
+    x_even = tl.load(rot_base + half_offset * 2).to(tl.float32)
+    x_odd = tl.load(rot_base + half_offset * 2 + 1).to(tl.float32)
+    r_even = x_even * cos - x_odd * sin
+    r_odd = x_odd * cos + x_even * sin
+    r_even = r_even.to(tl.bfloat16).to(tl.float32)
+    r_odd = r_odd.to(tl.bfloat16).to(tl.float32)
+
+    amax = tl.maximum(tl.max(tl.abs(r_even)), tl.max(tl.abs(r_odd)))
+    if INDEX_Q_NOPE_DIM > 0:
+        nope_offset = tl.arange(0, INDEX_Q_NOPE_DIM)
+        x_nope = tl.load(base_ptr + nope_offset).to(tl.float32)
+        amax = tl.maximum(amax, tl.max(tl.abs(x_nope)))
+    index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), 448.0)
+    index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
+
+    out_base_ptr = out_fp8_ptr + tok_idx * out_stride0 + head_idx * out_stride1
+    if INDEX_Q_NOPE_DIM > 0:
+        tl.store(
+            out_base_ptr + nope_offset,
+            _encode_e4m3fn_sw(tl.div_rn(x_nope, index_q_scale)),
+        )
+    out_rot_base = out_base_ptr + INDEX_Q_NOPE_DIM
+    tl.store(
+        out_rot_base + half_offset * 2,
+        _encode_e4m3fn_sw(tl.div_rn(r_even, index_q_scale)),
+    )
+    tl.store(
+        out_rot_base + half_offset * 2 + 1,
+        _encode_e4m3fn_sw(tl.div_rn(r_odd, index_q_scale)),
+    )
+
+    index_weights = tl.load(
+        index_weights_ptr + tok_idx * index_weights_stride + head_idx
+    )
+    index_weights = index_weights.to(tl.float32)
+    index_weights *= index_q_scale
+    index_weights *= index_weights_softmax_scale
+    index_weights *= index_weights_head_scale
+    tl.store(
+        index_weights_out_ptr + tok_idx * index_weights_out_stride + head_idx,
+        index_weights,
+    )
 
 
 @triton.jit
@@ -118,7 +264,7 @@ def _fused_indexer_q_rope_quant_kernel(
     r_even = x_even * cos - x_odd * sin
     r_odd = x_odd * cos + x_even * sin
 
-    # Match reference numerics: fp32 → bf16 → fp32 before the ue8m0 absmax.
+    # Match reference numerics: fp32 -> bf16 -> fp32 before the ue8m0 absmax.
     # Same pattern as the K-side compressor kernel (fused_compress_quant_cache.py).
     r_even = r_even.to(tl.bfloat16).to(tl.float32)
     r_odd = r_odd.to(tl.bfloat16).to(tl.float32)
@@ -153,7 +299,7 @@ def _fused_indexer_q_rope_quant_kernel(
     # FP8 weight-fold contract:
     #   index_weights_out = index_weights * q_scale * softmax_scale * head_scale
     # The per-token-per-head q_scale (fp32) IS folded into the output weights
-    # here because FP8 Q is stored WITHOUT a companion scale tensor — the
+    # here because FP8 Q is stored WITHOUT a companion scale tensor -- the
     # downstream fp8_fp4_mqa_logits/fp8_fp4_paged_mqa_logits kernels use `weights` to
     # apply per-token Q scale inline. See the MXFP4 kernel below for the
     # contrasting convention (scales live with the Q values, weights are NOT
@@ -269,7 +415,7 @@ def _fused_indexer_q_rope_mxfp4_kernel(
     # MXFP4 Q emits a separate ue8m0 scale tensor of shape
     # (T, H, HEAD_DIM // MXFP4_BLOCK) alongside the packed values, so each
     # per-block scale is applied by the downstream MXFP4 logits kernel when
-    # dequantizing Q — there is no per-token scalar to fold into `weights`.
+    # dequantizing Q -- there is no per-token scalar to fold into `weights`.
     index_weights = tl.load(
         index_weights_ptr + tok_idx * index_weights_stride + head_idx
     ).to(tl.float32)
@@ -296,11 +442,12 @@ def fused_indexer_q_rope_quant(
 ]:
     """Fused RoPE + quantize Q for the sparse indexer.
 
-    Weight-fold semantics (important — the two paths differ):
+    Weight-fold semantics (important -- the two paths differ):
 
     FP8 path (use_fp4=False, default):
-        q_fp8      : (T, H, HEAD_DIM) float8_e4m3fn, per-token-per-head
-                     scalar scale (NOT stored — folded into weights below)
+        q_fp8      : (T, H, HEAD_DIM) float8_e4m3fn, or raw uint8 FP8 bytes
+                     on SM80, with per-token-per-head scalar scale
+                     (NOT stored -- folded into weights below)
         weights_out = weights * q_scale * softmax_scale * head_scale
         Rationale: a single per-token q_scale is a scalar the downstream FP8
         logits kernel would otherwise multiply in. Folding it into `weights`
@@ -311,7 +458,7 @@ def fused_indexer_q_rope_quant(
         q_scale    : (T, H, HEAD_DIM // MXFP4_BLOCK_SIZE) uint8 ue8m0 bytes
         weights_out = weights * softmax_scale * head_scale
         Rationale: MXFP4 has PER-BLOCK (32-element) scales that live with
-        the Q values — they cannot be folded into a per-token weight
+        the Q values -- they cannot be folded into a per-token weight
         scalar, so `weights` carries only the softmax and head scales.
 
     Returns (q_quant, weights_out) where q_quant is either a Tensor (FP8) or
@@ -321,6 +468,43 @@ def fused_indexer_q_rope_quant(
     assert positions.ndim == 1
     assert index_q.ndim == 3
     assert index_q_cos_sin_cache.ndim == 2
+
+    if (
+        not use_fp4
+        and use_dsv4_reference_kernels()
+        and current_platform.is_cuda()
+        and not is_deep_gemm_supported()
+    ):
+        num_tokens = positions.shape[0]
+        num_index_q_heads = index_q.shape[1]
+        index_q_head_dim = index_q.shape[2]
+        out_fp8 = torch.empty(
+            (num_tokens, num_index_q_heads, index_q_head_dim),
+            dtype=torch.uint8,
+            device=index_q.device,
+        )
+        weights_out = torch.empty_like(index_weights, dtype=torch.float32)
+        _fused_indexer_q_rope_fp8_sw_kernel[(num_tokens, num_index_q_heads)](
+            positions,
+            index_q,
+            index_q.stride(0),
+            index_q.stride(1),
+            index_q_cos_sin_cache,
+            index_q_cos_sin_cache.stride(0),
+            index_q_cos_sin_cache.shape[-1] // 2,
+            out_fp8,
+            out_fp8.stride(0),
+            out_fp8.stride(1),
+            index_q_head_dim,
+            index_weights,
+            index_weights.stride(0),
+            index_weights_softmax_scale,
+            index_weights_head_scale,
+            weights_out,
+            weights_out.stride(0),
+            num_warps=1,
+        )
+        return out_fp8, weights_out
 
     num_tokens = positions.shape[0]
     num_index_q_heads = index_q.shape[1]

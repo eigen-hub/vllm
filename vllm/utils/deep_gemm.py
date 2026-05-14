@@ -93,6 +93,28 @@ def is_deep_gemm_supported() -> bool:
 
 
 @functools.cache
+def use_dsv4_reference_kernels() -> bool:
+    """Return True when DeepSeek V4 must avoid DeepGEMM/FlashMLA kernels.
+
+    SM80 can store and move the FP8 cache format, but it cannot run the
+    Hopper/Blackwell-only DeepGEMM and FlashMLA Sparse kernels used by the
+    native DeepSeek V4 path. Keep the decision centralized so the compressor,
+    indexer, attention, and output projection agree.
+    """
+    if current_platform.is_rocm():
+        return True
+    if not is_deep_gemm_supported():
+        return True
+    try:
+        from vllm.v1.attention.ops.flashmla import is_flashmla_sparse_supported
+
+        is_supported, _ = is_flashmla_sparse_supported()
+        return not is_supported
+    except Exception:
+        return True
+
+
+@functools.cache
 def is_deep_gemm_e8m0_used() -> bool:
     """Return `True` if vLLM is configured to use DeepGEMM "
     "E8M0 scale on a Hopper or Blackwell-class GPU.
@@ -348,7 +370,7 @@ def fp8_fp4_mqa_logits(
 ) -> torch.Tensor:
     """Compute MQA logits for a single sequence without KV paging.
 
-    Unified FP8/FP4 dispatch — the underlying DeepGEMM kernel takes
+    Unified FP8/FP4 dispatch -- the underlying DeepGEMM kernel takes
     ``q = (values, scales_or_None)`` where ``scales`` is None for FP8 Q
     (per-token scale is folded into ``weights``) and a packed block-scale
     tensor for MXFP4 Q.
@@ -358,7 +380,7 @@ def fp8_fp4_mqa_logits(
             float8_e4m3fn and q_scale is None (per-token scale is folded
             into ``weights``). FP4 path: q_values is packed uint8 and
             q_scale is the companion block-scale tensor.
-        kv: Tuple `(k_packed, k_scales)` — FP8 layout is [N, D]
+        kv: Tuple `(k_packed, k_scales)` -- FP8 layout is [N, D]
             float8_e4m3fn plus fp32 scales [N]; FP4 layout is packed uint8.
         weights: weights of shape [M, H], dtype `torch.float32`.
         cu_seqlen_ks: Start indices (inclusive) for valid K per query
@@ -416,7 +438,7 @@ def fp8_fp4_paged_mqa_logits(
 ) -> torch.Tensor:
     """Compute MQA logits using a paged KV-cache.
 
-    Unified FP8/FP4 dispatch — the underlying DeepGEMM kernel takes
+    Unified FP8/FP4 dispatch -- the underlying DeepGEMM kernel takes
     ``q = (values, scales_or_None)``; pass ``(q_tensor, None)`` for the FP8
     path and ``(q_values, q_scale)`` for MXFP4.
 

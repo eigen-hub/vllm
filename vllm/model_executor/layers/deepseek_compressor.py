@@ -303,7 +303,7 @@ class DeepseekCompressor(nn.Module):
         pdl_kwargs = {} if current_platform.is_rocm() else {"launch_pdl": False}
 
         # Store the KV and score (with fused APE addition) in the state.
-        # NOTE: PDL is disabled — both this kernel and _fused_kernel below
+        # NOTE: PDL is disabled -- both this kernel and _fused_kernel below
         # depend on preceding kernel outputs (kv/score from the cublas GEMM;
         # state_cache from this kernel) but neither emits/waits on PDL grid
         # dependency primitives, so launch_pdl=True caused a read-after-write
@@ -328,7 +328,7 @@ class DeepseekCompressor(nn.Module):
             **pdl_kwargs,
         )
 
-        # Fused: compress → RMSNorm → RoPE → FP8 quant → KV cache write.
+        # Fused: compress -> RMSNorm -> RoPE -> FP8 quant -> KV cache write.
         # RoPE requirements (kernel applies forward GPT-J style rotation):
         # - is_neox_style=False (interleaved pairs, NOT split-half)
         # - cos_sin_cache layout: [max_pos, rope_head_dim] with first half cos,
@@ -338,6 +338,16 @@ class DeepseekCompressor(nn.Module):
         cos_sin_cache = rotary_emb.cos_sin_cache
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
+
+        from vllm.utils.deep_gemm import use_dsv4_reference_kernels
+
+        is_mxfp4 = (
+            self._fused_kernel
+            is _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn
+        )
+        fp8_kwargs = (
+            {} if is_mxfp4 else {"SOFTWARE_FP8": use_dsv4_reference_kernels()}
+        )
 
         self._fused_kernel[(num_actual,)](
             # state cache
@@ -373,6 +383,7 @@ class DeepseekCompressor(nn.Module):
             TOKEN_STRIDE=self._token_stride,
             SCALE_DIM=self._scale_dim,
             KV_BLOCK_STRIDE=kv_cache.stride(0),
+            **fp8_kwargs,
             num_warps=self._num_warps,
             **pdl_kwargs,
         )

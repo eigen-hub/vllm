@@ -4,6 +4,7 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -18,7 +19,8 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
-from vllm.utils.deep_gemm import fp8_einsum
+from vllm.triton_utils import LOG2E, tl, triton
+from vllm.utils.deep_gemm import fp8_einsum, use_dsv4_reference_kernels
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.deepseek_v4_ops import (
     combine_topk_swa_indices,
@@ -27,6 +29,7 @@ from vllm.v1.attention.ops.deepseek_v4_ops import (
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
+    gather_dequant_two_scopes_with_mask,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_forward_decode_fallback,
@@ -78,6 +81,9 @@ from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
 )
+from vllm.v1.attention.ops.triton_sparse_mla_kernel import (
+    triton_sparse_mla_attention,
+)
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -87,6 +93,259 @@ logger = init_logger(__name__)
 # workspace allocated at _forward_prefill (and the matching profile-time
 # reservation in attention_impl's dummy-run branch).
 PREFILL_CHUNK_SIZE = 4
+
+
+@triton.jit
+def _dsv4_sm80_sparse_attn_split_kernel(
+    q_ptr,
+    kv_ptr,
+    invalid_mask_ptr,
+    acc_split_ptr,
+    max_split_ptr,
+    sum_split_ptr,
+    n_tokens,
+    total_topk,
+    sm_scale_log2,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    D_V: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    SPLIT_T: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_split = tl.program_id(1)
+    pid_h = tl.program_id(2)
+
+    if pid_t >= n_tokens:
+        return
+
+    chunk_size = (total_topk + SPLIT_T - 1) // SPLIT_T
+    n_start_chunk = pid_split * chunk_size
+    n_end_chunk = tl.minimum(n_start_chunk + chunk_size, total_topk)
+
+    head_off = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_mask = head_off < H
+    d_off = tl.arange(0, BLOCK_D)
+    d_mask = d_off < D
+
+    q = tl.load(
+        q_ptr + pid_t * H * D + head_off[:, None] * D + d_off[None, :],
+        mask=head_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+
+    e_max = tl.zeros((BLOCK_H,), dtype=tl.float32) - 1.0e30
+    e_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_H, BLOCK_DV), dtype=tl.float32)
+
+    n_iter = (chunk_size + BLOCK_N - 1) // BLOCK_N
+    for n_block in range(n_iter):
+        n_start = n_start_chunk + n_block * BLOCK_N
+        n_off = n_start + tl.arange(0, BLOCK_N)
+        n_mask = n_off < n_end_chunk
+
+        invalid_u8 = tl.load(
+            invalid_mask_ptr + pid_t * total_topk + n_off,
+            mask=n_mask,
+            other=1,
+        )
+        valid = (invalid_u8 == 0) & n_mask
+
+        kv = tl.load(
+            kv_ptr + pid_t * total_topk * D + n_off[:, None] * D + d_off[None, :],
+            mask=valid[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+
+        qk = tl.dot(q, tl.trans(kv))
+        qk *= sm_scale_log2
+        qk = tl.where(head_mask[:, None] & valid[None, :], qk, -1.0e30)
+
+        n_e_max = tl.maximum(tl.max(qk, axis=1), e_max)
+        re_scale = tl.exp2(e_max - n_e_max)
+        p = tl.exp2(qk - n_e_max[:, None])
+        p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+        acc *= re_scale[:, None]
+        acc += tl.dot(p.to(tl.bfloat16), kv)
+        e_sum = e_sum * re_scale + tl.sum(p, axis=1)
+        e_max = n_e_max
+
+    dv_off = tl.arange(0, BLOCK_DV)
+    dv_mask = dv_off < D_V
+    base_acc = (
+        pid_t * SPLIT_T * H * D_V
+        + pid_split * H * D_V
+        + head_off[:, None] * D_V
+        + dv_off[None, :]
+    )
+    tl.store(
+        acc_split_ptr + base_acc,
+        acc,
+        mask=head_mask[:, None] & dv_mask[None, :],
+    )
+
+    base_ms = pid_t * SPLIT_T * H + pid_split * H + head_off
+    tl.store(max_split_ptr + base_ms, e_max, mask=head_mask)
+    tl.store(sum_split_ptr + base_ms, e_sum, mask=head_mask)
+
+
+@triton.jit
+def _dsv4_sm80_sparse_attn_combine_kernel(
+    acc_split_ptr,
+    max_split_ptr,
+    sum_split_ptr,
+    attn_sink_ptr,
+    out_ptr,
+    n_tokens,
+    has_sink: tl.constexpr,
+    H: tl.constexpr,
+    D_V: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    SPLIT_T: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    if pid_t >= n_tokens:
+        return
+
+    head_off = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_mask = head_off < H
+
+    e_max_global = tl.zeros((BLOCK_H,), dtype=tl.float32) - 1.0e30
+    for s in range(SPLIT_T):
+        m = tl.load(
+            max_split_ptr + pid_t * SPLIT_T * H + s * H + head_off,
+            mask=head_mask,
+            other=-1.0e30,
+        )
+        e_max_global = tl.maximum(e_max_global, m)
+
+    sink_log2 = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    if has_sink:
+        sink = tl.load(attn_sink_ptr + head_off, mask=head_mask, other=0.0)
+        sink_log2 = sink * 1.4426950408889634
+        e_max_global = tl.maximum(e_max_global, sink_log2)
+
+    dv_off = tl.arange(0, BLOCK_DV)
+    dv_mask = dv_off < D_V
+    acc_global = tl.zeros((BLOCK_H, BLOCK_DV), dtype=tl.float32)
+    sum_global = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    for s in range(SPLIT_T):
+        m_s = tl.load(
+            max_split_ptr + pid_t * SPLIT_T * H + s * H + head_off,
+            mask=head_mask,
+            other=-1.0e30,
+        )
+        sum_s = tl.load(
+            sum_split_ptr + pid_t * SPLIT_T * H + s * H + head_off,
+            mask=head_mask,
+            other=0.0,
+        )
+        scale = tl.exp2(m_s - e_max_global)
+        sum_global += scale * sum_s
+
+        base_acc = (
+            pid_t * SPLIT_T * H * D_V
+            + s * H * D_V
+            + head_off[:, None] * D_V
+            + dv_off[None, :]
+        )
+        acc_s = tl.load(
+            acc_split_ptr + base_acc,
+            mask=head_mask[:, None] & dv_mask[None, :],
+            other=0.0,
+        )
+        acc_global += scale[:, None] * acc_s
+
+    if has_sink:
+        sum_global += tl.exp2(sink_log2 - e_max_global)
+
+    sum_safe = tl.where(sum_global > 0, sum_global, 1.0)
+    out = (acc_global / sum_safe[:, None]).to(tl.bfloat16)
+    tl.store(
+        out_ptr + pid_t * H * D_V + head_off[:, None] * D_V + dv_off[None, :],
+        out,
+        mask=head_mask[:, None] & dv_mask[None, :],
+    )
+
+
+def _dsv4_sm80_sparse_attn_decode_triton(
+    q: torch.Tensor,
+    gathered_kv: torch.Tensor,
+    invalid_mask: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    sm_scale: float,
+    head_dim_v: int,
+) -> torch.Tensor:
+    n_tokens, h, d = q.shape
+    _, t, d_kv = gathered_kv.shape
+    assert d_kv == d
+    assert invalid_mask.shape == (n_tokens, t)
+
+    block_d = triton.next_power_of_2(d)
+    block_dv = triton.next_power_of_2(head_dim_v)
+    block_h = 16
+    block_n = 32
+    n_tiles = (t + block_n - 1) // block_n
+    split_t = max(1, min(16, n_tiles))
+
+    out = torch.empty((n_tokens, h, head_dim_v), dtype=torch.bfloat16, device=q.device)
+    invalid_u8 = invalid_mask.to(torch.uint8)
+
+    acc_split = torch.empty(
+        (n_tokens, split_t, h, head_dim_v),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    max_split = torch.empty(
+        (n_tokens, split_t, h), dtype=torch.float32, device=q.device
+    )
+    sum_split = torch.empty_like(max_split)
+
+    grid_split = (n_tokens, split_t, triton.cdiv(h, block_h))
+    _dsv4_sm80_sparse_attn_split_kernel[grid_split](
+        q,
+        gathered_kv,
+        invalid_u8,
+        acc_split,
+        max_split,
+        sum_split,
+        n_tokens,
+        t,
+        sm_scale * LOG2E,
+        H=h,
+        D=d,
+        D_V=head_dim_v,
+        BLOCK_H=block_h,
+        BLOCK_N=block_n,
+        BLOCK_D=block_d,
+        BLOCK_DV=block_dv,
+        SPLIT_T=split_t,
+        num_warps=4,
+    )
+
+    grid_combine = (n_tokens, triton.cdiv(h, block_h))
+    _dsv4_sm80_sparse_attn_combine_kernel[grid_combine](
+        acc_split,
+        max_split,
+        sum_split,
+        attn_sink if attn_sink is not None else q.new_zeros(h),
+        out,
+        n_tokens,
+        has_sink=(attn_sink is not None),
+        H=h,
+        D_V=head_dim_v,
+        BLOCK_H=block_h,
+        BLOCK_DV=block_dv,
+        SPLIT_T=split_t,
+        num_warps=4,
+    )
+    return out
 
 
 @dataclass
@@ -190,24 +449,26 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         self.kv_norm = mla_modules.kv_norm
         self.wo_a = mla_modules.wo_a
+        self._wo_a_bmm_weight: torch.Tensor | None = None
 
         self._wo_a_act_quant = QuantFP8(
             static=False,
             group_shape=GroupShape(1, 128),
             use_ue8m0=True,
         )
-        # Bypass packed-for-deepgemm path — we need FP32 scales (not packed
+        # Bypass packed-for-deepgemm path -- we need FP32 scales (not packed
         # INT32) so fp8_einsum can handle layout transform internally.
         self._wo_a_act_quant.use_deep_gemm_supported = False
         self.wo_b = mla_modules.wo_b
 
         # Pick fp8_einsum recipe based on GPU arch:
-        # SM90: FP32 block scales stay [g, r/128, d/128] → sfb_gran_mn=128
-        # SM100: INT32 packed scales become [g, r, ...] → sfb_gran_mn=1
+        # SM90: FP32 block scales stay [g, r/128, d/128] -> sfb_gran_mn=128
+        # SM100: INT32 packed scales become [g, r, ...] -> sfb_gran_mn=1
         cap = current_platform.get_device_capability()
         assert cap is not None, "DeepseekV4 attention requires a CUDA device"
         self._einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
         self._tma_aligned_scales = cap.major >= 10
+        self._use_reference_kernels = use_dsv4_reference_kernels()
 
         self.rotary_emb = mla_modules.rotary_emb
         self.indexer_rotary_emb = mla_modules.indexer_rotary_emb
@@ -284,6 +545,37 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 k_cache_prefix=self.mla_attn.prefix,
             )
 
+    def _ensure_wo_a_bmm_weight(self, ref: torch.Tensor) -> None:
+        if self._wo_a_bmm_weight is not None:
+            return
+        k_dim = self.wo_a.input_size_per_partition
+        n_total = self.wo_a.output_size_per_partition
+        n_groups = self.n_local_groups
+        n_per_group = n_total // n_groups
+        eye = torch.eye(k_dim, dtype=ref.dtype, device=ref.device)
+        with torch.no_grad():
+            w_t = self.wo_a(eye)
+        if isinstance(w_t, tuple):
+            w_t = w_t[0]
+        self._wo_a_bmm_weight = (
+            w_t.view(k_dim, n_groups, n_per_group).permute(1, 0, 2).contiguous()
+        )
+
+    def _apply_wo_a_bmm(self, o_rotated: torch.Tensor) -> torch.Tensor:
+        self._ensure_wo_a_bmm_weight(o_rotated)
+        assert self._wo_a_bmm_weight is not None
+        n_groups = self.n_local_groups
+        num_tokens = o_rotated.shape[0]
+        k_per_group = self._wo_a_bmm_weight.shape[1]
+        n_per_group = self._wo_a_bmm_weight.shape[2]
+        x = (
+            o_rotated.reshape(num_tokens, n_groups, k_per_group)
+            .transpose(0, 1)
+            .contiguous()
+        )
+        out = torch.bmm(x, self._wo_a_bmm_weight)
+        return out.transpose(0, 1).reshape(num_tokens, n_groups * n_per_group)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -320,6 +612,20 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self.wo_a,
             )
             return self.wo_b(z.flatten(1))
+
+        if self._use_reference_kernels:
+            o_rotated = _apply_inv_rope_to_o(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.rope_head_dim,
+            )
+            if self.n_local_groups > 1:
+                return self.wo_b(self._apply_wo_a_bmm(o_rotated))
+            z = self.wo_a(o_rotated.flatten(1))
+            if isinstance(z, tuple):
+                z = z[0]
+            return self.wo_b(z)
 
         # O projection: inverse RoPE + FP8 quant + einsum + wo_b
         o_fp8, o_scale = fused_inv_rope_fp8_quant(
@@ -511,14 +817,17 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             out.zero_()
             return
 
-        # Pad q to FlashMLA-required head count (64 or 128)
-        if self.n_local_heads < self.padded_heads:
-            pad_size = self.padded_heads - self.n_local_heads
-            q = F.pad(q, (0, 0, 0, pad_size), value=0.0)
+        if self._use_reference_kernels:
+            self.mla_attn(q, kv, positions, output=out[:, : self.n_local_heads, :])
+        else:
+            # Pad q to FlashMLA-required head count (64 or 128)
+            if self.n_local_heads < self.padded_heads:
+                pad_size = self.padded_heads - self.n_local_heads
+                q = F.pad(q, (0, 0, 0, pad_size), value=0.0)
 
-        # MLA attention writes into the pre-allocated `out` buffer
-        # ([num_tokens, padded_heads, head_dim]).
-        self.mla_attn(q, kv, positions, output=out)
+            # MLA attention writes into the pre-allocated `out` buffer
+            # ([num_tokens, padded_heads, head_dim]).
+            self.mla_attn(q, kv, positions, output=out)
 
     def _fused_qnorm_rope_kv_insert(
         self,
@@ -585,6 +894,130 @@ direct_register_custom_op(
 )
 
 
+@triton.jit
+def _inv_rope_bf16_kernel(
+    o_ptr,
+    positions_ptr,
+    cos_sin_cache_ptr,
+    T,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    rope_dim: tl.constexpr,
+    half_rope: tl.constexpr,
+    nope_dim: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    if pid_t >= T:
+        return
+
+    pos = tl.load(positions_ptr + pid_t)
+    base_cs = cos_sin_cache_ptr + pos * rope_dim
+    r = tl.arange(0, half_rope)
+    cos_v = tl.load(base_cs + r).to(tl.float32)
+    sin_v = tl.load(base_cs + half_rope + r).to(tl.float32)
+
+    base_row = o_ptr + (pid_t * H + pid_h) * D + nope_dim
+    even = tl.load(base_row + 2 * r).to(tl.float32)
+    odd = tl.load(base_row + 2 * r + 1).to(tl.float32)
+    new_even = even * cos_v + odd * sin_v
+    new_odd = odd * cos_v - even * sin_v
+    tl.store(base_row + 2 * r, new_even.to(tl.bfloat16))
+    tl.store(base_row + 2 * r + 1, new_odd.to(tl.bfloat16))
+
+
+def _apply_inv_rope_to_o(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    rope_dim: int,
+) -> torch.Tensor:
+    if not o.is_contiguous():
+        o = o.contiguous()
+    out = o.clone()
+    num_tokens, num_heads, head_dim = out.shape
+    nope_dim = head_dim - rope_dim
+    half_rope = rope_dim // 2
+    _inv_rope_bf16_kernel[(num_tokens, num_heads)](
+        out,
+        positions.to(torch.int64).contiguous(),
+        cos_sin_cache,
+        num_tokens,
+        H=num_heads,
+        D=head_dim,
+        rope_dim=rope_dim,
+        half_rope=half_rope,
+        nope_dim=nope_dim,
+    )
+    return out
+
+
+def _decode_e8m0_scales(scale: torch.Tensor) -> torch.Tensor:
+    if scale.dtype == torch.float8_e8m0fnu:
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            _upcast_e8m0_to_fp32,
+        )
+
+        return _upcast_e8m0_to_fp32(scale).contiguous()
+    return scale.to(torch.float32)
+
+
+def _expand_last_dim_scales(scale: torch.Tensor, last_dim: int) -> torch.Tensor:
+    scale = _decode_e8m0_scales(scale)
+    block = math.ceil(last_dim / scale.shape[-1])
+    return torch.repeat_interleave(scale, block, dim=-1)[..., :last_dim]
+
+
+def _expand_2d_block_scales(
+    scale: torch.Tensor,
+    rows: int,
+    cols: int,
+) -> torch.Tensor:
+    scale = _decode_e8m0_scales(scale)
+    row_blocks, col_blocks = scale.shape[-2:]
+    row_block = math.ceil(rows / row_blocks)
+    col_block = math.ceil(cols / col_blocks)
+    scale = torch.repeat_interleave(scale, row_block, dim=-2)[..., :rows, :]
+    scale = torch.repeat_interleave(scale, col_block, dim=-1)[..., :, :cols]
+    return scale
+
+
+def _deepseek_v4_fp8_einsum_fallback(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: torch.Tensor,
+    equation: str,
+) -> None:
+    if equation != "bhr,hdr->bhd":
+        raise RuntimeError(f"Unsupported fallback equation: {equation}")
+
+    num_groups = a.shape[1]
+    hidden_dim = a.shape[2]
+    output_dim = b.shape[0] // num_groups
+
+    if b.shape[0] % num_groups != 0:
+        raise RuntimeError(
+            f"Cannot reshape weight of shape {tuple(b.shape)} into "
+            f"({num_groups}, {output_dim}, {hidden_dim})."
+        )
+
+    a_deq = (a.to(torch.float32) * _expand_last_dim_scales(a_scale, hidden_dim)).to(
+        torch.bfloat16
+    )
+
+    b_deq = b.view(num_groups, output_dim, hidden_dim).to(torch.float32)
+    b_scale_deq = _expand_2d_block_scales(
+        b_scale.view(num_groups, -1, b_scale.shape[-1]),
+        output_dim,
+        hidden_dim,
+    )
+    b_deq = (b_deq * b_scale_deq).to(torch.bfloat16)
+
+    out.copy_(torch.einsum(equation, a_deq, b_deq).to(out.dtype))
+
+
 def deepseek_v4_fp8_einsum(
     a: torch.Tensor,
     a_scale: torch.Tensor,
@@ -594,6 +1027,9 @@ def deepseek_v4_fp8_einsum(
     equation: str,
     recipe: list[int],
 ) -> None:
+    if use_dsv4_reference_kernels():
+        _deepseek_v4_fp8_einsum_fallback(a, a_scale, b, b_scale, out, equation)
+        return
     fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
 
 
@@ -663,6 +1099,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self._use_reference_kernels = use_dsv4_reference_kernels()
 
         # Determine padded head count for FlashMLA
         if num_heads not in self.SUPPORTED_HEAD_COUNTS:
@@ -838,6 +1275,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
+        assert swa_indices is not None
+        assert swa_lens is not None
 
         if current_platform.is_rocm():
             rocm_forward_decode_fallback(
@@ -856,6 +1295,36 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 rope_head_dim=self.rope_head_dim,
                 output=output,
             )
+            return
+
+        if self._use_reference_kernels:
+            extra_block_size = 0
+            if not swa_only:
+                assert attn_metadata is not None
+                assert kv_cache is not None
+                extra_block_size = attn_metadata.block_size // self.compress_ratio
+            gathered_kv, invalid_mask = gather_dequant_two_scopes_with_mask(
+                swa_kv_cache=self.swa_cache_layer.kv_cache,
+                swa_block_size=swa_metadata.block_size,
+                swa_indices=swa_indices.reshape(num_decode_tokens, -1),
+                swa_topk_length=swa_lens,
+                extra_kv_cache=None if swa_only else kv_cache,
+                extra_block_size=extra_block_size,
+                extra_indices=None if swa_only else topk_indices,
+                extra_topk_length=topk_lens,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+                head_dim=self.head_dim,
+            )
+            attn_out = _dsv4_sm80_sparse_attn_decode_triton(
+                q.to(torch.bfloat16).contiguous(),
+                gathered_kv,
+                invalid_mask,
+                self.attn_sink[: q.shape[1]],
+                self.scale,
+                self.head_dim,
+            )
+            output.copy_(attn_out.to(output.dtype))
             return
 
         # We treat queries in the same seq as different queries
@@ -1033,6 +1502,16 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     attn_sink=self.attn_sink,
                     output=output[query_start:query_end],
                 )
+            elif self._use_reference_kernels:
+                q_chunk = q[query_start:query_end]
+                out_chunk = triton_sparse_mla_attention(
+                    q_chunk,
+                    kv.view(-1, 1, q.shape[-1]),
+                    combined_indices.unsqueeze(1),
+                    sm_scale=self.scale,
+                    attn_sink=self.attn_sink[: q_chunk.shape[1]],
+                )
+                output[query_start:query_end].copy_(out_chunk.to(output.dtype))
             else:
                 output_chunk, _, _ = flash_mla_sparse_fwd(
                     q=q[query_start:query_end],
