@@ -55,6 +55,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
+from vllm.utils.deep_gemm import use_dsv4_reference_kernels
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .utils import (
@@ -68,6 +69,19 @@ from .utils import (
 )
 
 _DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8")
+
+
+def _use_deepseek_v4_mega_moe(vllm_config: VllmConfig) -> bool:
+    use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+    if use_mega_moe and use_dsv4_reference_kernels():
+        return False
+    if use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
+        raise NotImplementedError(
+            "DeepSeek V4 MegaMoE currently requires expert parallel. "
+            "Enable it with --enable-expert-parallel, or pick a different "
+            "moe backend."
+        )
+    return use_mega_moe
 
 
 class DeepseekV4MLP(nn.Module):
@@ -719,15 +733,7 @@ class DeepseekV4MoE(nn.Module):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.prefix = prefix
-        self.use_mega_moe = (
-            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
-        )
-        if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
-            raise NotImplementedError(
-                "DeepSeek V4 MegaMoE currently requires expert parallel. "
-                "Enable it with --enable-expert-parallel, or pick a different "
-                "moe backend."
-            )
+        self.use_mega_moe = _use_deepseek_v4_mega_moe(vllm_config)
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.hidden_size = config.hidden_size
@@ -1260,15 +1266,7 @@ class DeepseekV4Model(nn.Module):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
-        self.use_mega_moe = (
-            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
-        )
-        if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
-            raise NotImplementedError(
-                "DeepSeek V4 MegaMoE currently requires expert parallel. "
-                "Enable it with --enable-expert-parallel, or pick a different "
-                "moe backend."
-            )
+        self.use_mega_moe = _use_deepseek_v4_mega_moe(vllm_config)
         self.vocab_size = config.vocab_size
         self.hc_eps = config.hc_eps
         self.hc_mult = config.hc_mult

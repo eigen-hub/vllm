@@ -92,15 +92,7 @@ def is_deep_gemm_supported() -> bool:
     return envs.VLLM_USE_DEEP_GEMM and has_deep_gemm() and is_supported_arch
 
 
-@functools.cache
-def use_dsv4_reference_kernels() -> bool:
-    """Return True when DeepSeek V4 must avoid DeepGEMM/FlashMLA kernels.
-
-    SM80 can store and move the FP8 cache format, but it cannot run the
-    Hopper/Blackwell-only DeepGEMM and FlashMLA Sparse kernels used by the
-    native DeepSeek V4 path. Keep the decision centralized so the compressor,
-    indexer, attention, and output projection agree.
-    """
+def _resolve_use_dsv4_ref_kernels() -> bool:
     if current_platform.is_rocm():
         return True
     if not is_deep_gemm_supported():
@@ -112,6 +104,20 @@ def use_dsv4_reference_kernels() -> bool:
         return not is_supported
     except Exception:
         return True
+
+
+USE_DSV4_REF_KERNELS: bool = _resolve_use_dsv4_ref_kernels()
+
+
+def use_dsv4_reference_kernels() -> bool:
+    """Return True when DeepSeek V4 must avoid DeepGEMM/FlashMLA kernels.
+
+    SM80 can store and move the FP8 cache format, but it cannot run the
+    Hopper/Blackwell-only DeepGEMM and FlashMLA Sparse kernels used by the
+    native DeepSeek V4 path. Resolve once at import time so torch.compile sees
+    a plain Python bool instead of tracing through functools.cache wrappers.
+    """
+    return USE_DSV4_REF_KERNELS
 
 
 @functools.cache

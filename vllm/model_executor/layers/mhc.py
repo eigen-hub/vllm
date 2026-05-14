@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.platforms import current_platform
+from vllm.utils.deep_gemm import use_dsv4_reference_kernels
 from vllm.utils.import_utils import has_tilelang
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -234,7 +235,7 @@ def mhc_pre(
     num_tokens = residual_flat.shape[0]
     fn_flat = fn
 
-    if current_platform.is_rocm():
+    if use_dsv4_reference_kernels():
         x = residual_flat.view(num_tokens, hc_mult * hidden_size).to(torch.float32)
         mixes = torch.matmul(x, fn_flat.t())
         sqrsum = x.square().sum(dim=-1, keepdim=True)
@@ -572,7 +573,7 @@ def mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    if current_platform.is_rocm():
+    if use_dsv4_reference_kernels():
         mixed_residual = torch.einsum(
             "...ij,...ih->...jh",
             comb_res_mix.to(torch.float32),
@@ -652,6 +653,22 @@ def mhc_fused_post_pre(
     x_flat = x.view(num_tokens, hidden_size)
     post_layer_mix_flat = post_layer_mix.view(num_tokens, hc_mult)
     comb_res_mix_flat = comb_res_mix.view(num_tokens, hc_mult, hc_mult)
+
+    if use_dsv4_reference_kernels():
+        residual_cur = mhc_post(x, residual, post_layer_mix, comb_res_mix)
+        post_mix_cur, comb_mix_cur, layer_input_cur = mhc_pre(
+            residual_cur,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+        )
+        return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
 
     fma_token_threshold = 16
     if num_tokens <= fma_token_threshold:
@@ -992,7 +1009,7 @@ def _hc_head_fused_kernel(
     """Fill pre-allocated `out` (T, H) in-place with the hc_head result."""
     if hs_flat.shape[0] == 0:
         return
-    if current_platform.is_rocm():
+    if use_dsv4_reference_kernels():
         # tilelang ships only the CUDA codegen in upstream wheels, so the HIP
         # FFI target (`target.build.tilelang_hip`) is missing and the JIT call
         # would raise `ValueError: Cannot find global function ...`. Use a
