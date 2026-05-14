@@ -1381,6 +1381,150 @@ def gguf_quant_weights_iterator_multi(
                 yield name, param
 
 
+# DS4 GGUF files use non-standard tensor type codes (shifted by +1 for quantized types)
+# Mapping: ds4 type code -> standard GGML type code
+DS4_TO_STANDARD_TYPE_MAP = {
+    8: 7,    # ds4 Q8_0 (code 8) -> standard Q8_0 (code 7)
+    10: 9,   # ds4 Q2_K (code 10) -> standard Q2_K (code 9)
+    12: 11,  # ds4 Q4_K (code 12) -> standard Q4_K (code 11)
+    16: 15,  # ds4 IQ2_XXS (code 16) -> standard IQ2_XXS (code 15)
+}
+
+# Standard type codes that ds4 shares with GGML
+DS4_STANDARD_TYPES = {0, 1, 26}  # F32, F16, I32
+
+
+def gguf_quant_weights_iterator_ds4(
+    gguf_file: str | Path,
+    gguf_to_hf_name_map: dict[str, str],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """
+    Iterate over ds4 GGUF weights with non-standard type codes.
+
+    DS4 GGUF files use type codes shifted by +1 for quantized types.
+    The standard Python ``gguf.GGUFReader`` misinterprets these codes.
+    This function reads the tensor directory directly and yields weights
+    with correct type codes and shapes.
+    """
+    import numpy as np
+    import struct
+
+    # Open the GGUF file and parse the tensor directory directly
+    # to get raw type codes (bypassing the standard reader's interpretation)
+    with open(gguf_file, 'rb') as f:
+        magic = struct.unpack('<I', f.read(4))[0]
+        ver = struct.unpack('<I', f.read(4))[0]
+        n_tensors = struct.unpack('<Q', f.read(8))[0]
+        n_kv = struct.unpack('<Q', f.read(8))[0]
+        # Skip KV metadata
+        for _ in range(n_kv):
+            l = struct.unpack('<Q', f.read(8))[0]
+            f.read(l)
+            t = struct.unpack('<I', f.read(4))[0]
+            if t <= 1:
+                f.read(1)
+            elif t == 7:
+                f.read(1)
+            elif t in (2, 3):
+                f.read(2)
+            elif t in (4, 5, 6):
+                f.read(4)
+            elif t in (10, 11, 12):
+                f.read(8)
+            elif t == 8:
+                l2 = struct.unpack('<Q', f.read(8))[0]
+                f.read(l2)
+            else:
+                break
+        # Read tensor directory
+        tensor_dir_start = f.tell()
+        tensor_infos = {}
+        for i in range(n_tensors):
+            l = struct.unpack('<Q', f.read(8))[0]
+            name = f.read(l).decode(errors='replace')
+            ndim = struct.unpack('<I', f.read(4))[0]
+            dims = [struct.unpack('<Q', f.read(8))[0] for _ in range(ndim)]
+            tc = struct.unpack('<I', f.read(4))[0]
+            offset = struct.unpack('<Q', f.read(8))[0]
+            tensor_infos[name] = {
+                'ndim': ndim,
+                'dims': dims,
+                'type_code': tc,
+                'offset': offset,
+            }
+        tensor_data_start = f.tell()
+
+    # Now use the standard reader for iteration, but override type codes
+    reader = gguf.GGUFReader(gguf_file)
+
+    # First pass: yield weight types
+    for tensor in reader.tensors:
+        if tensor.name in gguf_to_hf_name_map:
+            raw_info = tensor_infos.get(tensor.name)
+            if raw_info is None:
+                continue
+            tc = raw_info['type_code']
+            name = gguf_to_hf_name_map[tensor.name]
+            if tc in DS4_TO_STANDARD_TYPE_MAP or tc not in DS4_STANDARD_TYPES:
+                weight_type_name = name.replace('weight', 'qweight_type')
+                weight_type = torch.tensor(tc)
+                yield weight_type_name, weight_type
+
+    # Second pass: yield weights
+    for tensor in reader.tensors:
+        if tensor.name in gguf_to_hf_name_map:
+            raw_info = tensor_infos.get(tensor.name)
+            if raw_info is None:
+                continue
+            tc = raw_info['type_code']
+            name = gguf_to_hf_name_map[tensor.name]
+
+            if tc in DS4_TO_STANDARD_TYPE_MAP or tc not in DS4_STANDARD_TYPES:
+                # Quantized ds4 tensor
+                name = name.replace('weight', 'qweight')
+                # Correct numpy shape = reversed GGML dims
+                numpy_shape = tuple(reversed(raw_info['dims']))
+                # Read raw data from file at the tensor's absolute offset
+                with open(gguf_file, 'rb') as f2:
+                    abs_offset = tensor_data_start + raw_info['offset']
+                    # Compute correct data size from dims and type code
+                    # Use ds4's block size definitions (same as standard for the actual type)
+                    # For Q8_0: block_elems=32, block_bytes=34
+                    # For IQ2_XXS: block_elems=256, block_bytes=66
+                    # For Q2_K: block_elems=256, block_bytes=84
+                    block_sizes = {
+                        8: (32, 34),   # ds4 Q8_0
+                        10: (256, 84),  # ds4 Q2_K
+                        16: (256, 66),  # ds4 IQ2_XXS
+                    }
+                    block_info = block_sizes.get(tc)
+                    if block_info:
+                        block_elems, block_bytes = block_info
+                        n_elems = 1
+                        for d in raw_info['dims']:
+                            n_elems *= d
+                        n_blocks = (n_elems + block_elems - 1) // block_elems
+                        data_size = n_blocks * block_bytes
+                    else:
+                        data_size = tensor.data.nbytes
+                    f2.seek(abs_offset)
+                    raw_bytes = f2.read(data_size)
+                weight = np.frombuffer(raw_bytes, dtype=np.uint8).copy()
+                weight = weight.reshape(numpy_shape)
+                param = torch.tensor(weight)
+                yield name, param
+            else:
+                # Standard types (F32, F16, I32)
+                weight = tensor.data
+                if tensor.tensor_type.name == "BF16" and weight.dtype == np.uint8:
+                    weight = weight.view(np.uint16)
+                    if reader.byte_order == "S":
+                        weight = weight.byteswap()
+                    param = torch.tensor(weight).view(torch.bfloat16)
+                else:
+                    param = torch.tensor(weight)
+                yield name, param
+
 def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
     """convert PySafeSlice object from safetensors to torch.Tensor
 

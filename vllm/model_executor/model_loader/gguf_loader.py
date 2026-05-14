@@ -25,6 +25,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     get_gguf_weight_type_map,
     gguf_quant_weights_iterator,
     gguf_quant_weights_iterator_multi,
+    gguf_quant_weights_iterator_ds4,
 )
 from vllm.transformers_utils.gguf_utils import detect_gguf_multimodal
 from vllm.utils.torch_utils import set_default_torch_dtype
@@ -345,11 +346,33 @@ class GGUFModelLoader(BaseModelLoader):
         model_name_or_path: str,
         gguf_to_hf_name_map: dict[str, str],
     ) -> dict[str, str]:
+        hf_config = model_config.hf_config
+        is_deepseek_v4 = hasattr(hf_config, "architectures") and \
+            "DeepseekV4ForCausalLM" in hf_config.architectures
+        if is_deepseek_v4:
+            # For DS4, use the custom iterator that reads raw type codes
+            weight_type_map = {}
+            for name, tensor in gguf_quant_weights_iterator_ds4(
+                model_name_or_path, gguf_to_hf_name_map
+            ):
+                if name.endswith(".qweight_type"):
+                    hf_name = name[:-12]  # strip .qweight_type
+                    type_val = tensor.item()
+                    # Map ds4 type code to a human-readable name
+                    ds4_type_names = {
+                        8: "Q8_0",
+                        10: "Q2_K",
+                        12: "Q4_K",
+                        16: "IQ2_XXS",
+                    }
+                    weight_type_map[hf_name] = ds4_type_names.get(type_val, str(type_val))
+            return weight_type_map
+
         gguf_files = self._get_all_gguf_files(model_name_or_path)
         weight_type_map = {}
         for f in gguf_files:
             weight_type_map.update(get_gguf_weight_type_map(f, gguf_to_hf_name_map))
-        is_multimodal = hasattr(model_config.hf_config, "vision_config")
+        is_multimodal = hasattr(hf_config, "vision_config")
         if is_multimodal:
             mmproj_file = detect_gguf_multimodal(model_name_or_path)
             assert mmproj_file is not None, (
@@ -381,6 +404,9 @@ class GGUFModelLoader(BaseModelLoader):
         """
         hf_config = model_config.hf_config
         is_multimodal = hasattr(hf_config, "vision_config")
+        # Detect DeepSeek V4 models by checking architectures
+        is_deepseek_v4 = hasattr(hf_config, "architectures") and \
+            "DeepseekV4ForCausalLM" in hf_config.architectures
 
         if is_multimodal:
             # Load mm_proj (mm_encoder + projector) for multimodal weights
@@ -390,15 +416,23 @@ class GGUFModelLoader(BaseModelLoader):
             )
             yield from gguf_quant_weights_iterator(mmproj_file, gguf_to_hf_name_map)
 
-        gguf_files = self._get_all_gguf_files(model_name_or_path)
-        if len(gguf_files) > 1:
-            yield from gguf_quant_weights_iterator_multi(
-                gguf_files, gguf_to_hf_name_map
-            )
-        else:
-            yield from gguf_quant_weights_iterator(
+        if is_deepseek_v4:
+            # DS4 GGUF files use non-standard type codes (shifted by +1 for
+            # quantized types). Use the custom ds4 iterator that reads the tensor
+            # directory directly to get correct type codes and shapes.
+            yield from gguf_quant_weights_iterator_ds4(
                 model_name_or_path, gguf_to_hf_name_map
             )
+        else:
+            gguf_files = self._get_all_gguf_files(model_name_or_path)
+            if len(gguf_files) > 1:
+                yield from gguf_quant_weights_iterator_multi(
+                    gguf_files, gguf_to_hf_name_map
+                )
+            else:
+                yield from gguf_quant_weights_iterator(
+                    model_name_or_path, gguf_to_hf_name_map
+                )
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config)
