@@ -29,6 +29,86 @@ _DEEPGEMM_BLACKWELL_EXCLUDED_MODEL_TYPES: set[str] = {
 }
 
 
+def _capability_supports_deep_gemm(capability: Any) -> bool:
+    if capability is None:
+        return False
+
+    return (capability.major == 9 and capability.minor == 0) or (
+        capability.major >= 10
+    )
+
+
+@functools.cache
+def _visible_cuda_capabilities() -> tuple[Any, ...]:
+    if not current_platform.is_cuda():
+        return ()
+
+    try:
+        device_count = current_platform.device_count()
+    except Exception:
+        logger.debug_once("Unable to query CUDA device count for DeepGEMM support.")
+        return ()
+
+    capabilities = []
+    for device_id in range(device_count):
+        try:
+            capability = current_platform.get_device_capability(device_id=device_id)
+        except Exception:
+            logger.debug_once(
+                "Unable to query CUDA device capability for DeepGEMM support."
+            )
+            return ()
+        if capability is None:
+            return ()
+        capabilities.append(capability)
+
+    return tuple(capabilities)
+
+
+@functools.cache
+def _visible_cuda_devices_support_deep_gemm() -> bool:
+    """Return whether all visible CUDA devices can share DeepGEMM kernels.
+
+    vLLM makes several DeepGEMM and DeepSeek V4 kernel decisions before worker
+    code is bound to a specific local rank. On mixed A100/H100 TP groups, using
+    logical device 0 alone can accidentally select Hopper kernels for A100
+    ranks. Require the visible CUDA set to be uniformly DeepGEMM-capable and
+    fall back to the SM80-safe path otherwise.
+    """
+    if not current_platform.is_cuda():
+        return current_platform.support_deep_gemm()
+
+    capabilities = _visible_cuda_capabilities()
+    if not capabilities:
+        return current_platform.support_deep_gemm()
+
+    unsupported = [
+        capability
+        for capability in capabilities
+        if not _capability_supports_deep_gemm(capability)
+    ]
+    if unsupported:
+        logger.info_once(
+            "DeepGEMM disabled because at least one visible CUDA device has "
+            "unsupported capability: %s.",
+            ", ".join(capability.as_version_str() for capability in capabilities),
+        )
+        return False
+
+    unique_capabilities = {
+        (capability.major, capability.minor) for capability in capabilities
+    }
+    if len(unique_capabilities) > 1:
+        logger.info_once(
+            "DeepGEMM disabled because visible CUDA devices have mixed "
+            "capabilities: %s.",
+            ", ".join(capability.as_version_str() for capability in capabilities),
+        )
+        return False
+
+    return True
+
+
 def should_auto_disable_deep_gemm(model_type: str | None) -> bool:
     """Check if DeepGemm should be auto-disabled for this model on Blackwell.
 
@@ -86,9 +166,9 @@ class DeepGemmQuantScaleFMT(Enum):
 @functools.cache
 def is_deep_gemm_supported() -> bool:
     """Return `True` if DeepGEMM is supported on the current platform.
-    Currently, only Hopper and Blackwell GPUs are supported.
+    Currently, only uniform Hopper or Blackwell CUDA visible sets are supported.
     """
-    is_supported_arch = current_platform.support_deep_gemm()
+    is_supported_arch = _visible_cuda_devices_support_deep_gemm()
     return envs.VLLM_USE_DEEP_GEMM and has_deep_gemm() and is_supported_arch
 
 
@@ -398,6 +478,8 @@ def fp8_fp4_mqa_logits(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
+    if not is_deep_gemm_supported():
+        return _missing()
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:
         return _missing()
@@ -426,6 +508,8 @@ def get_paged_mqa_logits_metadata(
         Backend-specific tensor consumed by `fp8_fp4_paged_mqa_logits` to
         schedule work across SMs.
     """
+    if not is_deep_gemm_supported():
+        return _missing()
     _lazy_init()
     if _get_paged_mqa_logits_metadata_impl is None:
         return _missing()
@@ -470,6 +554,8 @@ def fp8_fp4_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
+    if not is_deep_gemm_supported():
+        return _missing()
     _lazy_init()
     if _fp8_fp4_paged_mqa_logits_impl is None:
         return _missing()
