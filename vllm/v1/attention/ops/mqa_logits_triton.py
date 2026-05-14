@@ -180,7 +180,14 @@ def _fp8_paged_mqa_logits_kernel(
     if block_rk * block_size >= context_len:
         return
 
-    q_offset = context_len - 1
+    # When context_lens_width >= next_n, each position has its own column
+    # with the effective context length, so q_offset = context_len - 1.
+    # When width == 1 (1D broadcast), compute per-position offset so
+    # autoregressive causal masking works for speculative (next_n > 1).
+    if context_lens_width >= next_n:
+        q_offset = context_len - 1
+    else:
+        q_offset = context_len - next_n + next_n_id
 
     block_idx = tl.load(
         block_tables_ptr + batch_id * stride_bt_b + block_rk * stride_bt_k
