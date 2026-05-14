@@ -175,6 +175,17 @@ def is_deep_gemm_supported() -> bool:
 def _resolve_use_dsv4_ref_kernels() -> bool:
     if current_platform.is_rocm():
         return True
+    
+    # Best effort: check all local devices first. If any local device is 
+    # SM80, the current node must use reference kernels. 
+    # For multi-node TP, we still need sync_dsv4_reference_kernels() 
+    # called after distributed init.
+    num_devices = torch.cuda.device_count()
+    for i in range(num_devices):
+        cap = torch.cuda.get_device_capability(i)
+        if cap[0] < 9:
+            return True
+
     if not is_deep_gemm_supported():
         return True
     try:
@@ -187,6 +198,17 @@ def _resolve_use_dsv4_ref_kernels() -> bool:
 
 
 USE_DSV4_REF_KERNELS: bool = _resolve_use_dsv4_ref_kernels()
+
+
+def sync_dsv4_reference_kernels(use_ref: bool) -> None:
+    """Explicitly synchronize the reference kernel flag across TP ranks.
+    
+    In heterogeneous clusters (e.g. H100 + A100), Rank 0 might resolve 
+    to False while other ranks resolve to True. This function allows
+    Rank 0's decision (or the group's consensus) to be forced on all ranks.
+    """
+    global USE_DSV4_REF_KERNELS
+    USE_DSV4_REF_KERNELS = use_ref
 
 
 def use_dsv4_reference_kernels() -> bool:
