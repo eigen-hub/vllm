@@ -433,6 +433,7 @@ class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
             w2_bias=layer.w2_bias,
             per_act_token_quant=self.input_qscheme == "per_channel",
             per_out_ch_quant=self.weight_qscheme == "per_channel",
+            gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
         )
 
     def apply(
@@ -899,6 +900,7 @@ class QuarkW4A8Fp8MoEMethod(QuarkMoEMethod):
             w1_scale=layer.w13_weight_scale_2,
             w2_scale=layer.w2_weight_scale_2,
             per_out_ch_quant=True,
+            gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
         )
 
     def apply(
