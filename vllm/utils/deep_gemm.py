@@ -211,6 +211,39 @@ def sync_dsv4_reference_kernels(use_ref: bool) -> None:
     USE_DSV4_REF_KERNELS = use_ref
 
 
+def sync_dsv4_reference_kernels_group() -> None:
+    """Synchronize USE_DSV4_REF_KERNELS across the TP group after distributed init.
+
+    Each worker resolves independently at module import time based on its local
+    device. On heterogeneous clusters (e.g. H100 + A100), workers may disagree.
+    This function all-reduces the per-worker decisions to compute the logical OR:
+    if ANY worker needs reference kernels, ALL workers use them.
+
+    Must be called after the TP group is initialized, before any model code
+    dispatches based on USE_DSV4_REF_KERNELS.
+    """
+    import torch
+    from vllm.distributed import get_tp_group
+
+    try:
+        tp_group = get_tp_group()
+    except (AssertionError, RuntimeError):
+        # Distributed group not yet initialized — skip sync, keep local decision.
+        return
+
+    if tp_group.world_size <= 1:
+        # Single GPU — module-level flag is already correct.
+        return
+
+    # Each worker contributes its local decision
+    local_flag = torch.tensor([1 if USE_DSV4_REF_KERNELS else 0],
+                               device="cuda", dtype=torch.int32)
+    summed = tp_group.all_reduce(local_flag)
+    use_ref = summed.item() > 0
+
+    sync_dsv4_reference_kernels(use_ref)
+
+
 def use_dsv4_reference_kernels() -> bool:
     """Return True when DeepSeek V4 must avoid DeepGEMM/FlashMLA kernels.
 

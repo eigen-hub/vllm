@@ -55,7 +55,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
-from vllm.utils.deep_gemm import use_dsv4_reference_kernels
+from vllm.utils.deep_gemm import use_dsv4_reference_kernels, sync_dsv4_reference_kernels_group
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .utils import (
@@ -1262,6 +1262,13 @@ class DeepseekV4DecoderLayer(nn.Module):
 class DeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+
+        # Synchronize USE_DSV4_REF_KERNELS across TP group before any
+        # dispatch decisions. On heterogeneous clusters (H100 + A100),
+        # module-level resolution produces different values per worker.
+        # After sync, ALL workers agree on the same value (logical OR:
+        # if ANY worker needs reference kernels, ALL use them).
+        sync_dsv4_reference_kernels_group()
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
