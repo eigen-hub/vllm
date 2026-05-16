@@ -25,6 +25,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.deepseek_v4_ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
+    dequantize_and_gather_k_cache,
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
