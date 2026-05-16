@@ -25,11 +25,9 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.deepseek_v4_ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
-    dequantize_and_gather_k_cache,
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
-    gather_dequant_two_scopes_with_mask,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_forward_decode_fallback,
@@ -1299,30 +1297,48 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         if self._use_reference_kernels:
             extra_block_size = 0
+            extra_indices_flat = None
+            extra_topk = 0
             if not swa_only:
                 assert attn_metadata is not None
                 assert kv_cache is not None
                 extra_block_size = attn_metadata.block_size // self.compress_ratio
-            gathered_kv, invalid_mask = gather_dequant_two_scopes_with_mask(
-                swa_kv_cache=self.swa_cache_layer.kv_cache,
-                swa_block_size=swa_metadata.block_size,
-                swa_indices=swa_indices.reshape(num_decode_tokens, -1),
-                swa_topk_length=swa_lens,
-                extra_kv_cache=None if swa_only else kv_cache,
-                extra_block_size=extra_block_size,
-                extra_indices=None if swa_only else topk_indices,
-                extra_topk_length=topk_lens,
-                nope_dim=self.nope_head_dim,
-                rope_dim=self.rope_head_dim,
-                head_dim=self.head_dim,
+                extra_indices_flat = topk_indices.reshape(topk_indices.shape[0], -1)
+                extra_topk = extra_indices_flat.shape[1]
+            swa_topk = swa_indices.shape[-1]
+            total_topk = swa_topk + extra_topk
+            gathered = torch.empty(
+                (num_decode_tokens, total_topk, self.head_dim),
+                dtype=torch.bfloat16, device=q.device,
             )
-            attn_out = _dsv4_sm80_sparse_attn_decode_triton(
-                q.to(torch.bfloat16).contiguous(),
-                gathered_kv,
-                invalid_mask,
-                self.attn_sink[: q.shape[1]],
-                self.scale,
+            invalid_mask = torch.empty(
+                (num_decode_tokens, total_topk),
+                dtype=torch.bool, device=q.device,
+            )
+            torch.ops.vllm.deepseek_v4_gather_sm80(
+                gathered, invalid_mask,
+                self.swa_cache_layer.kv_cache,
+                swa_metadata.block_size,
+                swa_indices.reshape(num_decode_tokens, -1),
+                swa_lens,
+                None if swa_only else kv_cache,
+                extra_block_size,
+                extra_indices_flat,
+                topk_lens,
+                self.nope_head_dim,
+                self.rope_head_dim,
                 self.head_dim,
+            )
+            attn_out = torch.empty(
+                (num_decode_tokens, q.shape[1], self.head_dim),
+                dtype=torch.bfloat16, device=q.device,
+            )
+            torch.ops.vllm.deepseek_v4_sparse_decode_sm80(
+                attn_out,
+                q.to(torch.bfloat16).contiguous(),
+                gathered, invalid_mask,
+                self.attn_sink[: q.shape[1]],
+                self.scale, self.head_dim,
             )
             output.copy_(attn_out.to(output.dtype))
             return
@@ -1686,3 +1702,35 @@ class DeepseekV4Indexer(nn.Module):
             use_fp4=self.use_fp4_kv,
         )
         return self.indexer_op(hidden_states, q_quant, k, weights)
+
+
+def _sparse_decode_sm80_op(
+    out: torch.Tensor,
+    q: torch.Tensor,
+    gathered_kv: torch.Tensor,
+    invalid_mask: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    sm_scale: float,
+    head_dim_v: int,
+) -> None:
+    out.copy_(
+        _dsv4_sm80_sparse_attn_decode_triton(
+            q, gathered_kv, invalid_mask, attn_sink, sm_scale, head_dim_v,
+        )
+    )
+
+
+def _sparse_decode_sm80_op_fake(
+    out: torch.Tensor,
+    q: torch.Tensor,
+    **kwargs,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_sparse_decode_sm80",
+    op_func=_sparse_decode_sm80_op,
+    mutates_args=["out"],
+    fake_impl=_sparse_decode_sm80_op_fake,
+)

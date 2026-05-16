@@ -936,6 +936,54 @@ def gather_dequant_two_scopes_with_mask(
     return gathered, invalid_mask
 
 
+def _gather_sm80_op(
+    gathered: torch.Tensor,
+    invalid_mask: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    swa_block_size: int,
+    swa_indices: torch.Tensor,
+    swa_topk_length: torch.Tensor | None,
+    extra_kv_cache: torch.Tensor | None,
+    extra_block_size: int,
+    extra_indices: torch.Tensor | None,
+    extra_topk_length: torch.Tensor | None,
+    nope_dim: int,
+    rope_dim: int,
+    head_dim: int,
+) -> None:
+    gathered_out, invalid_out = gather_dequant_two_scopes_with_mask(
+        swa_kv_cache,
+        swa_block_size,
+        swa_indices,
+        swa_topk_length,
+        extra_kv_cache,
+        extra_block_size,
+        extra_indices,
+        extra_topk_length,
+        nope_dim,
+        rope_dim,
+        head_dim,
+    )
+    gathered.copy_(gathered_out)
+    invalid_mask.copy_(invalid_out)
+
+
+def _gather_sm80_op_fake(
+    gathered: torch.Tensor,
+    invalid_mask: torch.Tensor,
+    **kwargs,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_gather_sm80",
+    op_func=_gather_sm80_op,
+    mutates_args=["gathered", "invalid_mask"],
+    fake_impl=_gather_sm80_op_fake,
+)
+
+
 def compute_global_topk_indices_and_lens(
     topk_indices: torch.Tensor,
     token_to_req_indices: torch.Tensor,

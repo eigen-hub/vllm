@@ -1122,6 +1122,20 @@ class CompilationConfig:
                     self.splitting_ops.append("vllm::unified_kv_cache_update")
                     self.splitting_ops.append("vllm::unified_mla_kv_cache_update")
 
+                    # SM80 reference fallback custom ops — opaque to inductor.
+                    # split_graph() creates sub-graph boundaries at these ops
+                    # so inductor never compiles their internal torch.empty()
+                    # + Triton kernel pattern under torch.compile.
+                    self.splitting_ops.append(
+                        "vllm::deepseek_v4_dequant_gather_sm80"
+                    )
+                    self.splitting_ops.append(
+                        "vllm::deepseek_v4_gather_sm80"
+                    )
+                    self.splitting_ops.append(
+                        "vllm::deepseek_v4_sparse_decode_sm80"
+                    )
+
             elif len(self.splitting_ops) == 0:
                 if (
                     self.cudagraph_mode == CUDAGraphMode.PIECEWISE
