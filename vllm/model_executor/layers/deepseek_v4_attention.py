@@ -168,7 +168,8 @@ def _dsv4_sm80_sparse_attn_split_kernel(
         p = tl.exp2(qk - n_e_max[:, None])
         p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
         acc *= re_scale[:, None]
-        acc += tl.dot(p.to(tl.bfloat16), kv)
+        # Use float16 instead of bfloat16 for better mantissa precision on softmax probabilities
+        acc += tl.dot(p.to(tl.float16), kv.to(tl.float16))
         e_sum = e_sum * re_scale + tl.sum(p, axis=1)
         e_max = n_e_max
 
