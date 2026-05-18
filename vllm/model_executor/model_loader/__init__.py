@@ -135,12 +135,18 @@ def get_model(
     loader = get_model_loader(load_config or vllm_config.load_config)
     if model_config is None:
         model_config = vllm_config.model_config
-        
-    # Synchronize reference kernel flag for DeepSeek V4 before model construction
-    if model_config.hf_config is not None and getattr(model_config.hf_config, "architectures", None):
-        if any("DeepseekV4" in arch for arch in model_config.hf_config.architectures):
-            from vllm.utils.deep_gemm import sync_dsv4_reference_kernels_group
-            sync_dsv4_reference_kernels_group()
+
+    # Synchronize reference kernel flag for DeepSeek V4 before model construction.
+    # Check architectures list first, fall back to model name for GGUF/non-standard paths.
+    _is_dsv4 = False
+    if model_config.hf_config is not None:
+        archs = getattr(model_config.hf_config, "architectures", None) or []
+        _is_dsv4 = any("DeepseekV4" in arch for arch in archs)
+    if not _is_dsv4 and model_config.model is not None:
+        _is_dsv4 = "deepseek" in model_config.model.lower() and "v4" in model_config.model.lower()
+    if _is_dsv4:
+        from vllm.utils.deep_gemm import sync_dsv4_reference_kernels_group
+        sync_dsv4_reference_kernels_group()
 
     return loader.load_model(
         vllm_config=vllm_config, model_config=model_config, prefix=prefix

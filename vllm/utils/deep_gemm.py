@@ -198,6 +198,7 @@ def _resolve_use_dsv4_ref_kernels() -> bool:
 
 
 _USE_DSV4_REF_KERNELS: bool | None = None
+_DSV4_REF_KERNELS_SYNCED: bool = False
 
 
 def sync_dsv4_reference_kernels(use_ref: bool) -> None:
@@ -207,21 +208,28 @@ def sync_dsv4_reference_kernels(use_ref: bool) -> None:
     to False while other ranks resolve to True. This function allows
     Rank 0's decision (or the group's consensus) to be forced on all ranks.
     """
-    global _USE_DSV4_REF_KERNELS
+    global _USE_DSV4_REF_KERNELS, _DSV4_REF_KERNELS_SYNCED
     _USE_DSV4_REF_KERNELS = use_ref
+    _DSV4_REF_KERNELS_SYNCED = True
 
 
 def sync_dsv4_reference_kernels_group() -> None:
     """Synchronize USE_DSV4_REF_KERNELS across the TP group after distributed init.
 
-    Each worker resolves independently at module import time based on its local
-    device. On heterogeneous clusters (e.g. H100 + A100), workers may disagree.
+    Each worker resolves independently based on its local device.
+    On heterogeneous clusters (e.g. H100 + A100), workers may disagree.
     This function all-reduces the per-worker decisions to compute the logical OR:
     if ANY worker needs reference kernels, ALL workers use them.
+
+    Idempotent: safe to call multiple times (no-op after first successful sync).
 
     Must be called after the TP group is initialized, before any model code
     dispatches based on USE_DSV4_REF_KERNELS.
     """
+    global _DSV4_REF_KERNELS_SYNCED
+    if _DSV4_REF_KERNELS_SYNCED:
+        return
+
     import torch
     from vllm.distributed import get_tp_group
 
@@ -232,7 +240,8 @@ def sync_dsv4_reference_kernels_group() -> None:
         return
 
     if tp_group.world_size <= 1:
-        # Single GPU — module-level flag is already correct.
+        # Single GPU — local resolution is authoritative.
+        _DSV4_REF_KERNELS_SYNCED = True
         return
 
     # Each worker contributes its local decision
@@ -250,8 +259,8 @@ def use_dsv4_reference_kernels() -> bool:
 
     SM80 can store and move the FP8 cache format, but it cannot run the
     Hopper/Blackwell-only DeepGEMM and FlashMLA Sparse kernels used by the
-    native DeepSeek V4 path. Resolve once at import time so torch.compile sees
-    a plain Python bool instead of tracing through functools.cache wrappers.
+    native DeepSeek V4 path. Lazily resolved on first call; overridden if
+    sync_dsv4_reference_kernels_group() runs later (or before).
     """
     global _USE_DSV4_REF_KERNELS
     if _USE_DSV4_REF_KERNELS is None:
