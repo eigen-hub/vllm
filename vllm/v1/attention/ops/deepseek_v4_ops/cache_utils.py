@@ -811,6 +811,8 @@ def gather_dequant_two_scopes_with_mask(
     nope_dim: int,
     rope_dim: int,
     head_dim: int,
+    gathered_out: torch.Tensor | None = None,
+    invalid_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run gather + invalid-mask production for SWA and (optionally) extra
     KV in two kernel launches that write into a single pre-allocated
@@ -841,10 +843,10 @@ def gather_dequant_two_scopes_with_mask(
     total_topk = swa_topk + extra_topk
 
     device = swa_kv_cache.device
-    gathered = torch.empty(
+    gathered = gathered_out if gathered_out is not None else torch.empty(
         (n_tokens, total_topk, head_dim), dtype=torch.bfloat16, device=device
     )
-    invalid_mask = torch.empty(
+    invalid_mask = invalid_out if invalid_out is not None else torch.empty(
         (n_tokens, total_topk), dtype=torch.bool, device=device
     )
 
@@ -951,7 +953,7 @@ def _gather_sm80_op(
     rope_dim: int,
     head_dim: int,
 ) -> None:
-    gathered_out, invalid_out = gather_dequant_two_scopes_with_mask(
+    gather_dequant_two_scopes_with_mask(
         swa_kv_cache,
         swa_block_size,
         swa_indices,
@@ -963,9 +965,9 @@ def _gather_sm80_op(
         nope_dim,
         rope_dim,
         head_dim,
+        gathered,
+        invalid_mask,
     )
-    gathered.copy_(gathered_out)
-    invalid_mask.copy_(invalid_out)
 
 
 def _gather_sm80_op_fake(

@@ -197,7 +197,7 @@ def _resolve_use_dsv4_ref_kernels() -> bool:
         return True
 
 
-USE_DSV4_REF_KERNELS: bool = _resolve_use_dsv4_ref_kernels()
+_USE_DSV4_REF_KERNELS: bool | None = None
 
 
 def sync_dsv4_reference_kernels(use_ref: bool) -> None:
@@ -207,8 +207,8 @@ def sync_dsv4_reference_kernels(use_ref: bool) -> None:
     to False while other ranks resolve to True. This function allows
     Rank 0's decision (or the group's consensus) to be forced on all ranks.
     """
-    global USE_DSV4_REF_KERNELS
-    USE_DSV4_REF_KERNELS = use_ref
+    global _USE_DSV4_REF_KERNELS
+    _USE_DSV4_REF_KERNELS = use_ref
 
 
 def sync_dsv4_reference_kernels_group() -> None:
@@ -236,7 +236,8 @@ def sync_dsv4_reference_kernels_group() -> None:
         return
 
     # Each worker contributes its local decision
-    local_flag = torch.tensor([1 if USE_DSV4_REF_KERNELS else 0],
+    local_decision = _resolve_use_dsv4_ref_kernels()
+    local_flag = torch.tensor([1 if local_decision else 0],
                                device="cuda", dtype=torch.int32)
     summed = tp_group.all_reduce(local_flag)
     use_ref = summed.item() > 0
@@ -252,7 +253,10 @@ def use_dsv4_reference_kernels() -> bool:
     native DeepSeek V4 path. Resolve once at import time so torch.compile sees
     a plain Python bool instead of tracing through functools.cache wrappers.
     """
-    return USE_DSV4_REF_KERNELS
+    global _USE_DSV4_REF_KERNELS
+    if _USE_DSV4_REF_KERNELS is None:
+        _USE_DSV4_REF_KERNELS = _resolve_use_dsv4_ref_kernels()
+    return _USE_DSV4_REF_KERNELS
 
 
 @functools.cache

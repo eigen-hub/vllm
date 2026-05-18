@@ -1263,13 +1263,6 @@ class DeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
-        # Synchronize USE_DSV4_REF_KERNELS across TP group before any
-        # dispatch decisions. On heterogeneous clusters (H100 + A100),
-        # module-level resolution produces different values per worker.
-        # After sync, ALL workers agree on the same value (logical OR:
-        # if ANY worker needs reference kernels, ALL use them).
-        sync_dsv4_reference_kernels_group()
-
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config

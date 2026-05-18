@@ -184,9 +184,13 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                 self.passes += [QKNormRoPEFusionPass(config)]
 
             self.ir_lowering = VllmIRLoweringPass(config)
-            # DISABLED: UnsafeCloneEliminationPass causes incorrect torch.compile
-            # output on mixed SM80+SM90. Root cause of SM80 garbage output bug.
-            self.clone_elimination = None  # UnsafeCloneEliminationPass(config)
+            from vllm.utils.deep_gemm import use_dsv4_reference_kernels
+            if use_dsv4_reference_kernels():
+                # DISABLED: UnsafeCloneEliminationPass causes incorrect torch.compile
+                # output on mixed SM80+SM90. Root cause of SM80 garbage output bug.
+                self.clone_elimination = None
+            else:
+                self.clone_elimination = UnsafeCloneEliminationPass(config)
             self.post_cleanup = PostCleanupPass(config)
             self.fix_functionalization = FixFunctionalizationPass(config)
 
