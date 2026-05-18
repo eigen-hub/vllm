@@ -116,7 +116,8 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
         # DCE handles mutating ops correctly as well.
         self.ir_lowering(graph)
         VllmInductorPass.dump_prefix += 1
-        self.clone_elimination(graph)
+        if self.clone_elimination is not None:
+            self.clone_elimination(graph)
         VllmInductorPass.dump_prefix += 1
 
         # clean up after lowering again
@@ -183,7 +184,9 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                 self.passes += [QKNormRoPEFusionPass(config)]
 
             self.ir_lowering = VllmIRLoweringPass(config)
-            self.clone_elimination = UnsafeCloneEliminationPass(config)
+            # DISABLED: UnsafeCloneEliminationPass causes incorrect torch.compile
+            # output on mixed SM80+SM90. Root cause of SM80 garbage output bug.
+            self.clone_elimination = None  # UnsafeCloneEliminationPass(config)
             self.post_cleanup = PostCleanupPass(config)
             self.fix_functionalization = FixFunctionalizationPass(config)
 
@@ -205,7 +208,8 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
 
         passes.append(self.post_cleanup.uuid())
         passes.append(self.ir_lowering.uuid())
-        passes.append(self.clone_elimination.uuid())
+        if self.clone_elimination is not None:
+            passes.append(self.clone_elimination.uuid())
         passes.append(self.post_cleanup.uuid())
         passes.append(self.fix_functionalization.uuid())
 
