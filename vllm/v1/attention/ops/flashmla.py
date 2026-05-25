@@ -48,6 +48,19 @@ def _is_flashmla_available() -> tuple[bool, str | None]:
     return True, None
 
 
+def _current_cuda_device_id() -> int:
+    if not current_platform.is_cuda():
+        return 0
+
+    try:
+        if torch.cuda.is_available():
+            return torch.cuda.current_device()
+    except Exception:
+        logger.debug_once("Unable to query current CUDA device for FlashMLA support.")
+
+    return 0
+
+
 def is_flashmla_dense_supported() -> tuple[bool, str | None]:
     """
     Return: is_supported_flag, unsupported_reason (optional).
@@ -55,7 +68,8 @@ def is_flashmla_dense_supported() -> tuple[bool, str | None]:
     is_available, maybe_reason = _is_flashmla_available()
     if not is_available:
         return False, maybe_reason
-    if not current_platform.is_device_capability_family(90):
+    device_id = _current_cuda_device_id()
+    if not current_platform.is_device_capability_family(90, device_id=device_id):
         return False, "FlashMLA Dense is only supported on Hopper devices."
     return True, None
 
@@ -67,9 +81,10 @@ def is_flashmla_sparse_supported() -> tuple[bool, str | None]:
     is_available, maybe_reason = _is_flashmla_available()
     if not is_available:
         return False, maybe_reason
+    device_id = _current_cuda_device_id()
     if not (
-        current_platform.is_device_capability_family(90)
-        or current_platform.is_device_capability_family(100)
+        current_platform.is_device_capability_family(90, device_id=device_id)
+        or current_platform.is_device_capability_family(100, device_id=device_id)
     ):
         return (
             False,

@@ -29,32 +29,60 @@ class FakeCudaPlatform:
 @pytest.fixture(autouse=True)
 def clear_deep_gemm_support_caches():
     deep_gemm.is_deep_gemm_supported.cache_clear()
-    deep_gemm._visible_cuda_capabilities.cache_clear()
-    deep_gemm._visible_cuda_devices_support_deep_gemm.cache_clear()
+    deep_gemm._current_cuda_capability.cache_clear()
+    deep_gemm._current_cuda_device_supports_deep_gemm.cache_clear()
+    deep_gemm.is_deep_gemm_e8m0_used.cache_clear()
+    deep_gemm._USE_DSV4_REF_KERNELS = None
+    deep_gemm._DSV4_REF_KERNELS_SYNCED = False
 
     yield
 
     deep_gemm.is_deep_gemm_supported.cache_clear()
-    deep_gemm._visible_cuda_capabilities.cache_clear()
-    deep_gemm._visible_cuda_devices_support_deep_gemm.cache_clear()
+    deep_gemm._current_cuda_capability.cache_clear()
+    deep_gemm._current_cuda_device_supports_deep_gemm.cache_clear()
+    deep_gemm.is_deep_gemm_e8m0_used.cache_clear()
+    deep_gemm._USE_DSV4_REF_KERNELS = None
+    deep_gemm._DSV4_REF_KERNELS_SYNCED = False
 
 
 @pytest.mark.parametrize(
-    ("capabilities", "expected"),
+    ("capabilities", "current_device", "expected"),
     [
-        ((DeviceCapability(9, 0), DeviceCapability(9, 0)), True),
-        ((DeviceCapability(8, 0), DeviceCapability(9, 0)), False),
-        ((DeviceCapability(9, 0), DeviceCapability(10, 0)), False),
-        ((DeviceCapability(8, 0), DeviceCapability(8, 0)), False),
+        ((DeviceCapability(8, 0), DeviceCapability(9, 0)), 0, False),
+        ((DeviceCapability(8, 0), DeviceCapability(9, 0)), 1, True),
+        ((DeviceCapability(9, 0), DeviceCapability(10, 0)), 0, True),
+        ((DeviceCapability(9, 0), DeviceCapability(10, 0)), 1, True),
+        ((DeviceCapability(8, 0), DeviceCapability(8, 0)), 0, False),
     ],
 )
-def test_deep_gemm_requires_uniform_supported_cuda_visible_set(
+def test_deep_gemm_uses_current_cuda_device(
     monkeypatch: pytest.MonkeyPatch,
     capabilities: tuple[DeviceCapability, ...],
+    current_device: int,
     expected: bool,
 ):
     monkeypatch.setattr(deep_gemm, "current_platform", FakeCudaPlatform(capabilities))
+    monkeypatch.setattr(deep_gemm, "_current_cuda_device_id", lambda: current_device)
     monkeypatch.setattr(deep_gemm, "has_deep_gemm", lambda: True)
     monkeypatch.setattr(deep_gemm.envs, "VLLM_USE_DEEP_GEMM", True)
 
     assert deep_gemm.is_deep_gemm_supported() is expected
+
+
+def test_dsv4_reference_sync_disables_deep_gemm_for_tp_group(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        deep_gemm,
+        "current_platform",
+        FakeCudaPlatform((DeviceCapability(9, 0),)),
+    )
+    monkeypatch.setattr(deep_gemm, "_current_cuda_device_id", lambda: 0)
+    monkeypatch.setattr(deep_gemm, "has_deep_gemm", lambda: True)
+    monkeypatch.setattr(deep_gemm.envs, "VLLM_USE_DEEP_GEMM", True)
+
+    assert deep_gemm.is_deep_gemm_supported() is True
+
+    deep_gemm.sync_dsv4_reference_kernels(True)
+
+    assert deep_gemm.is_deep_gemm_supported() is False
