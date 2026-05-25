@@ -673,6 +673,57 @@ class VllmConfig:
 
         apply_recursive(self, defaults)
 
+    def _is_deepseek_v4_pp(self) -> bool:
+        return (
+            self.model_config is not None
+            and self.model_config.architecture == "DeepseekV4ForCausalLM"
+            and self.parallel_config.pipeline_parallel_size > 1
+        )
+
+    def _disable_torch_compile_for_deepseek_v4_pp(self) -> None:
+        if (
+            not self._is_deepseek_v4_pp()
+            or self.compilation_config.mode is None
+            or self.compilation_config.mode == CompilationMode.NONE
+        ):
+            return
+
+        # Dynamo tracing runs real forwards. With DeepSeek V4 PP+TP, those
+        # forwards can desynchronize ranks around TP collectives; full CUDA
+        # graph capture is separate and works without torch.compile.
+        logger.warning_once(
+            "DeepSeek V4 with pipeline parallelism does not currently support "
+            "torch.compile. Disabling torch.compile while leaving CUDA graph "
+            "capture enabled when supported."
+        )
+        self.compilation_config.mode = CompilationMode.NONE
+
+    def _adjust_cudagraphs_for_deepseek_v4_pp_no_compile(self) -> None:
+        if (
+            not self._is_deepseek_v4_pp()
+            or self.compilation_config.mode != CompilationMode.NONE
+        ):
+            return
+
+        cudagraph_mode = self.compilation_config.cudagraph_mode
+        if cudagraph_mode is None or not cudagraph_mode.has_piecewise_cudagraphs():
+            return
+
+        if cudagraph_mode.has_full_cudagraphs():
+            logger.warning_once(
+                "DeepSeek V4 with pipeline parallelism is running without "
+                "torch.compile, so piecewise CUDA graphs are unavailable. "
+                "Using full CUDA graphs only."
+            )
+            self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+        else:
+            logger.warning_once(
+                "DeepSeek V4 with pipeline parallelism is running without "
+                "torch.compile, so piecewise CUDA graphs are unavailable. "
+                "Disabling CUDA graphs."
+            )
+            self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
     def _post_init_kv_transfer_config(self) -> None:
         """Update KVTransferConfig based on top-level configs in VllmConfig.
 
@@ -988,6 +1039,8 @@ class VllmConfig:
             else:
                 self.compilation_config.mode = CompilationMode.NONE
 
+        self._disable_torch_compile_for_deepseek_v4_pp()
+
         # By default, enable torch wrapping only when using custom Inductor lowering
         if self.compilation_config.ir_enable_torch_wrap is None:
             self.compilation_config.ir_enable_torch_wrap = (
@@ -1016,6 +1069,8 @@ class VllmConfig:
                 "KernelConfig.enable_flashinfer_autotune must be set after applying "
                 "optimization level defaults."
             )
+
+        self._adjust_cudagraphs_for_deepseek_v4_pp_no_compile()
 
         if (
             self.compilation_config.cudagraph_mode.requires_piecewise_compilation()
