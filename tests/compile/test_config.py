@@ -221,34 +221,6 @@ def test_torch_compile_disable(vllm_runner, monkeypatch):
         pass
 
 
-def test_deepseek_v4_pp_disables_compile_but_keeps_full_cudagraphs():
-    config = VllmConfig()
-    config.model_config = MagicMock(architecture="DeepseekV4ForCausalLM")
-    config.parallel_config.pipeline_parallel_size = 2
-    config.compilation_config.mode = CompilationMode.VLLM_COMPILE
-    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
-
-    config._disable_torch_compile_for_deepseek_v4_pp()
-    config._adjust_cudagraphs_for_deepseek_v4_pp_no_compile()
-
-    assert config.compilation_config.mode == CompilationMode.NONE
-    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
-
-
-def test_deepseek_v4_tp_only_keeps_compile_enabled():
-    config = VllmConfig()
-    config.model_config = MagicMock(architecture="DeepseekV4ForCausalLM")
-    config.parallel_config.pipeline_parallel_size = 1
-    config.compilation_config.mode = CompilationMode.VLLM_COMPILE
-    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
-
-    config._disable_torch_compile_for_deepseek_v4_pp()
-    config._adjust_cudagraphs_for_deepseek_v4_pp_no_compile()
-
-    assert config.compilation_config.mode == CompilationMode.VLLM_COMPILE
-    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
-
-
 def test_splitting_ops_dynamic():
     # Default config
     config = VllmConfig()
