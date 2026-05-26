@@ -454,16 +454,25 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default_template: str | None,
         default_template_content_format: ChatTemplateContentFormatOption,
     ) -> ChatParams:
+        # Include any extra fields (like Anthropic-style `thinking: { type: "enabled" }`)
+        # in chat_template_kwargs so the DeepSeek V4 tokenizer and reasoning parser
+        # can find them. This allows callers like pi to send thinking as a top-level
+        # parameter instead of inside chat_template_kwargs.
+        extra = self.model_extra or {}
+        extra_kwargs = {k: v for k, v in extra.items()}
         return ChatParams(
             chat_template=self.chat_template or default_template,
             chat_template_content_format=default_template_content_format,
             chat_template_kwargs=merge_kwargs(
                 self.chat_template_kwargs,
-                dict(
-                    add_generation_prompt=self.add_generation_prompt,
-                    continue_final_message=self.continue_final_message,
-                    documents=self.documents,
-                    reasoning_effort=self.reasoning_effort,
+                merge_kwargs(
+                    dict(
+                        add_generation_prompt=self.add_generation_prompt,
+                        continue_final_message=self.continue_final_message,
+                        documents=self.documents,
+                        reasoning_effort=self.reasoning_effort,
+                    ),
+                    extra_kwargs,
                 ),
             ),
             media_io_kwargs=self.media_io_kwargs,

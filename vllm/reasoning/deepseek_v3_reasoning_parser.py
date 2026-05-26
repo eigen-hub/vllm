@@ -30,8 +30,15 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
         super().__init__(tokenizer, *args, **kwargs)
 
         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
-        thinking = bool(chat_kwargs.get("thinking", False))
+        # Accept both:
+        #   enable_thinking: True  (OpenAI/vllm style)
+        #   thinking: { type: "enabled" }  (Anthropic style, sent by pi)
+        thinking_raw = chat_kwargs.get("thinking", False)
         enable_thinking = bool(chat_kwargs.get("enable_thinking", False))
+        if isinstance(thinking_raw, dict):
+            thinking = thinking_raw.get("type") == "enabled"
+        else:
+            thinking = bool(thinking_raw)
         thinking = thinking or enable_thinking
 
         self._parser: ReasoningParser

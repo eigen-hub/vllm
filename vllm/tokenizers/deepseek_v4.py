@@ -29,8 +29,16 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
             tools: list[dict[str, Any]] | None = None,
             **kwargs,
         ) -> str | list[int]:
-            thinking = kwargs.get("thinking", False)
+            # Accept both:
+            #   enable_thinking: True  (OpenAI/vllm style)
+            #   thinking: { type: "enabled" }  (Anthropic style, sent by pi)
+            thinking_raw = kwargs.get("thinking", False)
             enable_thinking = kwargs.get("enable_thinking", False)
+            if isinstance(thinking_raw, dict):
+                # Anthropic-style: { type: "enabled" } or { type: "disabled" }
+                thinking = thinking_raw.get("type") == "enabled"
+            else:
+                thinking = bool(thinking_raw)
             thinking = thinking or enable_thinking
             thinking_mode = "thinking" if thinking else "chat"
 
