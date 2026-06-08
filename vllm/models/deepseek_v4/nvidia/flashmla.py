@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -22,6 +23,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
 )
 from vllm.triton_utils import LOG2E, tl, triton
 from vllm.utils.deep_gemm import use_dsv4_reference_kernels_current_device
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
@@ -76,7 +78,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         )
 
     def _ensure_wo_a_bmm_weight(self, ref: torch.Tensor) -> None:
-        if getattr(self, '_wo_a_bmm_weight', None) is not None:
+        if getattr(self, "_wo_a_bmm_weight", None) is not None:
             return
         k_dim = self.wo_a.input_size_per_partition
         n_total = self.wo_a.output_size_per_partition
@@ -234,6 +236,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         # We treat queries in the same seq as different queries
         # and later we only attend by generated indices.
         # q arrives pre-padded to self.padded_heads by the outer wrapper.
+        num_q_heads = q.shape[1]
         q = q.unsqueeze(1)
 
         # Prepare SWA cache (num_blocks, swa_block_size, 1, head_bytes)
@@ -274,13 +277,17 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             total_topk = swa_topk + extra_topk
             gathered = torch.empty(
                 (num_decode_tokens, total_topk, self.head_dim),
-                dtype=torch.bfloat16, device=q.device,
+                dtype=torch.bfloat16,
+                device=q.device,
             )
             invalid_mask = torch.empty(
-                (num_decode_tokens, total_topk), dtype=torch.bool, device=q.device,
+                (num_decode_tokens, total_topk),
+                dtype=torch.bool,
+                device=q.device,
             )
             torch.ops.vllm.deepseek_v4_gather_sm80(
-                gathered, invalid_mask,
+                gathered,
+                invalid_mask,
                 self.swa_cache_layer.kv_cache,
                 swa_metadata.block_size,
                 swa_indices.reshape(num_decode_tokens, -1),
@@ -289,14 +296,18 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 extra_block_size,
                 extra_indices_flat,
                 topk_lens,
-                self.nope_head_dim, self.rope_head_dim, self.head_dim,
+                self.nope_head_dim,
+                self.rope_head_dim,
+                self.head_dim,
             )
             torch.ops.vllm.deepseek_v4_sparse_decode_sm80(
                 output.unsqueeze(1),
                 q.to(torch.bfloat16).contiguous(),
-                gathered.unsqueeze(1), invalid_mask.unsqueeze(1),
-                self.attn_sink[:q.shape[1]],
-                self.scale, self.head_dim,
+                gathered.unsqueeze(1),
+                invalid_mask.unsqueeze(1),
+                self.attn_sink[:num_q_heads],
+                self.scale,
+                self.head_dim,
             )
         else:
             assert tile_metadata is not None, (
@@ -433,29 +444,32 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 M,
                 N,
             )
-        if self._use_reference_kernels:
-            out_chunk = triton_sparse_mla_attention(
-                q[query_start:query_end],
-                kv.view(-1, 1, q.shape[-1]),
-                combined_indices.unsqueeze(1),
-                sm_scale=self.scale,
-                attn_sink=self.attn_sink[: q[query_start:query_end].shape[1]],
-            )
-            output[query_start:query_end].copy_(out_chunk)
-        else:
-            flash_mla_sparse_fwd(
-                q=q[query_start:query_end],
-                kv=kv.view(-1, 1, q.shape[-1]),
-                indices=combined_indices.unsqueeze(1),
-                sm_scale=self.scale,
-                attn_sink=self.attn_sink,
-                topk_length=combined_lens,
-                out=output[query_start:query_end],
-            )
+            if self._use_reference_kernels:
+                q_chunk = q[query_start:query_end]
+                out_chunk = triton_sparse_mla_attention(
+                    q_chunk,
+                    kv.view(-1, 1, q.shape[-1]),
+                    combined_indices.unsqueeze(1),
+                    sm_scale=self.scale,
+                    attn_sink=self.attn_sink[: q_chunk.shape[1]],
+                )
+                output[query_start:query_end].copy_(out_chunk)
+            else:
+                flash_mla_sparse_fwd(
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices.unsqueeze(1),
+                    sm_scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    topk_length=combined_lens,
+                    out=output[query_start:query_end],
+                )
+
 
 # ---------------------------------------------------------------------------
 # SM80 reference kernel helpers
 # ---------------------------------------------------------------------------
+
 
 @triton.jit
 def _inv_rope_bf16_kernel(
@@ -523,8 +537,6 @@ def _dsv4_sm80_o_proj_fake(
     return torch.empty_like(o)
 
 
-from vllm.utils.torch_utils import direct_register_custom_op
-
 direct_register_custom_op(
     op_name="dsv4_sm80_o_proj",
     op_func=_apply_inv_rope_to_o,
@@ -536,14 +548,13 @@ direct_register_custom_op(
 # SM80 FP8 einsum fallback
 # ---------------------------------------------------------------------------
 
-import math
-
 
 def _decode_e8m0_scales(scale: torch.Tensor) -> torch.Tensor:
     if scale.dtype == torch.float8_e8m0fnu:
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             _upcast_e8m0_to_fp32,
         )
+
         return _upcast_e8m0_to_fp32(scale).contiguous()
     return scale.to(torch.float32)
 
@@ -612,10 +623,12 @@ def deepseek_v4_fp8_einsum(
     recipe: list[int],
 ) -> None:
     from vllm.utils.deep_gemm import use_dsv4_reference_kernels_current_device
+
     if use_dsv4_reference_kernels_current_device():
         _deepseek_v4_fp8_einsum_fallback(a, a_scale, b, b_scale, out, equation)
         return
     from vllm.utils.deep_gemm import fp8_einsum
+
     fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
 
 
@@ -629,6 +642,7 @@ direct_register_custom_op(
 # ---------------------------------------------------------------------------
 # SM80 Triton sparse attention for decode
 # ---------------------------------------------------------------------------
+
 
 @triton.jit
 def _dsv4_sm80_sparse_attn_split_kernel(
@@ -895,8 +909,12 @@ def _sparse_decode_sm80_op(
     # expects 3D (num_tokens, H, D). Squeeze the singleton batch dim.
     out.copy_(
         _dsv4_sm80_sparse_attn_decode_triton(
-            q.squeeze(1), gathered_kv.squeeze(1), invalid_mask.squeeze(1),
-            attn_sink, sm_scale, head_dim_v,
+            q.squeeze(1),
+            gathered_kv.squeeze(1),
+            invalid_mask.squeeze(1),
+            attn_sink,
+            sm_scale,
+            head_dim_v,
         ).unsqueeze(1)
     )
 
@@ -927,13 +945,21 @@ def _gather_sm80_op(
     from vllm.models.deepseek_v4.common.ops.sm80_gather import (
         gather_dequant_two_scopes_with_mask,
     )
+
     gather_dequant_two_scopes_with_mask(
-        swa_kv_cache, swa_block_size,
-        swa_indices, swa_topk_length,
-        extra_kv_cache, extra_block_size,
-        extra_indices, extra_topk_length,
-        nope_dim, rope_dim, head_dim,
-        gathered, invalid_mask,
+        swa_kv_cache,
+        swa_block_size,
+        swa_indices,
+        swa_topk_length,
+        extra_kv_cache,
+        extra_block_size,
+        extra_indices,
+        extra_topk_length,
+        nope_dim,
+        rope_dim,
+        head_dim,
+        gathered,
+        invalid_mask,
     )
 
 
@@ -959,6 +985,11 @@ def triton_sparse_mla_attention(
     from vllm.v1.attention.ops.triton_sparse_mla_kernel import (
         triton_sparse_mla_attention as _kernel_attn,
     )
+
     return _kernel_attn(
-        q, kv, indices, sm_scale=sm_scale, attn_sink=attn_sink,
+        q,
+        kv,
+        indices,
+        sm_scale=sm_scale,
+        attn_sink=attn_sink,
     )

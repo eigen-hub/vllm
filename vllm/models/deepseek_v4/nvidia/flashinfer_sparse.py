@@ -26,6 +26,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLABackend,
     DeepseekV4FlashMLAMetadata,
 )
+from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
 
 if TYPE_CHECKING:
@@ -62,6 +63,13 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
     @staticmethod
     def get_name() -> str:
         return "FLASHINFER_MLA_SPARSE_DSV4"
+
+    @classmethod
+    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+        # This backend calls FlashInfer TRTLLM-gen and DeepGEMM paths directly.
+        # Use the FlashMLA DSV4 backend for SM80/SM90 mixed clusters; it has the
+        # per-device SM80 reference fallbacks.
+        return capability.major == 10
 
 
 class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):

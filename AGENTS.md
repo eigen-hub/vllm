@@ -39,66 +39,24 @@ If work is duplicate/trivial busywork, **do not proceed**. Return a short explan
 
 ## 2. Development Workflow
 
-- **Never use system `python3` or bare `pip`/`pip install`.** All Python commands must go through `uv` and `.venv/bin/python`.
+- **Use miniconda python**: `~/miniconda3/bin/python` (also available as `python` in PATH).
+- **Never use system `python3`**.
 
-### Environment setup
+### Environment
 
-```bash
-# Install `uv` if you don't have it already:
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Always use `uv` for Python environment management:
-uv venv --python 3.12
-source .venv/bin/activate
-
-# Always make sure `pre-commit` and its hooks are installed:
-uv pip install -r requirements/lint.txt
-pre-commit install
-```
-
-### Installing dependencies
-
-```bash
-# If you are only making Python changes:
-VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
-
-# If you are also making C/C++ changes:
-uv pip install -e . --torch-backend=auto
-```
-
-### Running tests
-
-> Requires [Environment setup](#environment-setup) and [Installing dependencies](#installing-dependencies).
-
-```bash
-# Install test dependencies.
-# requirements/test/cuda.txt is pinned to x86_64; on other platforms, use the
-# unpinned source file instead:
-uv pip install -r requirements/test/cuda.in    # resolves for current platform
-# Or on x86_64:
-uv pip install -r requirements/test/cuda.txt
-
-# Run a specific test file (use .venv/bin/python directly;
-# `source activate` does not persist in non-interactive shells):
-.venv/bin/python -m pytest tests/path/to/test_file.py -v
-```
+The miniconda base environment has all dependencies pre-installed (torch, vllm, ruff, etc.). No venv setup needed.
 
 ### Running linters
 
-> Requires [Environment setup](#environment-setup).
-
 ```bash
-# Run all pre-commit hooks on staged files:
+# Ruff is available in miniconda:
+python -m ruff check path/to/file.py
+ruff check path/to/file.py       # if ruff is in PATH
+
+# Run pre-commit hooks:
 pre-commit run
-
-# Run on all files:
 pre-commit run --all-files
-
-# Run a specific hook:
 pre-commit run ruff-check --all-files
-
-# Run mypy as it is in CI:
-pre-commit run mypy-3.12 --all-files --hook-stage manual
 ```
 
 The line length limit for Python code is 88 characters. If you are not sure, use pre-commit to check.

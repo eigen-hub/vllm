@@ -580,6 +580,8 @@ def fp8_fp4_mqa_logits(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
+    if not is_deep_gemm_supported():
+        return _missing()
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:
         return _missing()
@@ -608,6 +610,8 @@ def get_paged_mqa_logits_metadata(
         Backend-specific tensor consumed by `fp8_fp4_paged_mqa_logits` to
         schedule work across SMs.
     """
+    if not is_deep_gemm_supported():
+        return _missing()
     _lazy_init()
     if _get_paged_mqa_logits_metadata_impl is None:
         return _missing()
@@ -652,6 +656,8 @@ def fp8_fp4_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
+    if not is_deep_gemm_supported():
+        return _missing()
     _lazy_init()
     if _fp8_fp4_paged_mqa_logits_impl is None:
         return _missing()

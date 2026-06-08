@@ -20,7 +20,6 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import current_cuda_device_supports_deep_gemm
 from vllm.utils.import_utils import has_cutedsl
-from vllm.v1.attention.ops.mqa_logits_triton import _decode_e4m3fn
 
 
 @triton.jit
@@ -369,9 +368,6 @@ def dequantize_and_gather_k_cache(
 ) -> None:
     # SM80 fallback: use software E4M3 decoder path
     if current_platform.is_cuda() and not current_cuda_device_supports_deep_gemm():
-        from vllm.models.deepseek_v4.common.ops.sm80_gather import (
-            _dequant_gather_sm80_op_fake,
-        )
         # Re-use the existing _dequantize_and_gather_k_kernel but note that
         # it uses tl.float8e4nv which fails on SM80. For SM80 gather during
         # prefill we need the SM80 triton path. For decode gather the
@@ -379,6 +375,7 @@ def dequantize_and_gather_k_cache(
         from vllm.models.deepseek_v4.common.ops.sm80_gather import (
             _dequantize_and_gather_k_cache_sm80,
         )
+
         _dequantize_and_gather_k_cache_sm80(
             out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
         )
@@ -388,6 +385,7 @@ def dequantize_and_gather_k_cache(
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             dequantize_and_gather_k_cache_cutedsl,
         )
+
         dequantize_and_gather_k_cache_cutedsl(
             out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
         )

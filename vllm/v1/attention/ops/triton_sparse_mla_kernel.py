@@ -22,8 +22,8 @@ from vllm.utils.platform_utils import num_compute_units
 # so autotune compiles separate versions; DIM_QK is inferred from the
 # input tensor at dispatch time.
 _BLOCK_DV = 512
-_DIM_QK_V3 = 576   # V3.2 / GLM-5
-_DIM_QK_V4 = 512   # DeepSeek V4
+_DIM_QK_V3 = 576  # V3.2 / GLM-5
+_DIM_QK_V4 = 512  # DeepSeek V4
 
 # Backward compatibility alias for existing tests
 _DIM_QK = _DIM_QK_V3
@@ -259,8 +259,7 @@ def _sparse_mla_kernel_final(
 
     if has_sink:
         sink_log2 = (
-            tl.load(attn_sink_ptr + cur_head, mask=mask_h, other=-float("inf"))
-            * LOG2E
+            tl.load(attn_sink_ptr + cur_head, mask=mask_h, other=-float("inf")) * LOG2E
         )
         n_e_max = tl.maximum(e_max, sink_log2)
         kv_scale = tl.exp2(e_max - n_e_max)

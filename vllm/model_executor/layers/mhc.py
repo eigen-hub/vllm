@@ -316,14 +316,16 @@ class HCHeadOp(CustomOp):
                 hc_mult,
             )
         else:
-            torch.ops.vllm.hc_head_fused_kernel_tilelang(
-                hs_flat,
-                hc_fn,
-                hc_scale,
-                hc_base,
-                rms_norm_eps,
-                hc_eps,
-            ).copy_(out)
+            out.copy_(
+                torch.ops.vllm.hc_head_fused_kernel_tilelang(
+                    hs_flat,
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                    rms_norm_eps,
+                    hc_eps,
+                )
+            )
         return out.view(*outer_shape, hidden_size)
 
     def forward_hip(
