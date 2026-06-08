@@ -77,6 +77,7 @@ class CpuPlatform(Platform):
         selected_backend: "AttentionBackendEnum",
         attn_selector_config: "AttentionSelectorConfig",
         num_heads: int | None = None,
+        device_id: int | None = None,
     ) -> str:
         if selected_backend and selected_backend != AttentionBackendEnum.CPU_ATTN:
             logger.info("Cannot use %s backend on CPU.", selected_backend)

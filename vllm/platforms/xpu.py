@@ -52,6 +52,7 @@ class XPUPlatform(Platform):
         selected_backend: "AttentionBackendEnum",
         attn_selector_config: "AttentionSelectorConfig",
         num_heads: int | None = None,
+        device_id: int | None = None,
     ) -> str:
         from vllm.v1.attention.backends.utils import set_kv_cache_layout
 

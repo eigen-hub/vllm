@@ -15,7 +15,7 @@ from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
-    has_deep_gemm,
+    is_deep_gemm_supported,
 )
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -27,6 +27,10 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
@@ -230,14 +234,28 @@ def sparse_attn_indexer(
                     chunk.cu_seqlen_ke,
                 )
             else:
-                logits = fp8_fp4_mqa_logits(
-                    (q_slice_cast, q_scale_slice),
-                    (k_quant_cast, k_scale_cast),
-                    weights[chunk.token_start : chunk.token_end],
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    clean_logits=False,
-                )
+                if is_deep_gemm_supported():
+                    logits = fp8_fp4_mqa_logits(
+                        (q_slice_cast, q_scale_slice),
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        clean_logits=False,
+                    )
+                else:
+                    # SM80 fallback: use Triton MQA logits instead of DeepGEMM
+                    assert not use_fp4_cache, (
+                        "Triton sparse indexer fallback does not support FP4 KV cache"
+                    )
+                    logits = fp8_mqa_logits_triton(
+                        q_slice_cast,
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        clean_logits=False,
+                    )
             num_rows = logits.shape[0]
 
             topk_indices = topk_indices_buffer[
@@ -321,16 +339,31 @@ def sparse_attn_indexer(
                 max_model_len,
             )
         else:
-            logits = fp8_fp4_paged_mqa_logits(
-                (padded_q_quant_cast, padded_q_scale),
-                kv_cache,
-                weights[:num_padded_tokens],
-                seq_lens,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
-                clean_logits=False,
-            )
+            if is_deep_gemm_supported():
+                logits = fp8_fp4_paged_mqa_logits(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_model_len,
+                    clean_logits=False,
+                )
+            else:
+                # SM80 fallback: use Triton paged MQA logits
+                assert not use_fp4_cache, (
+                    "Triton sparse indexer fallback does not support FP4 KV cache"
+                )
+                logits = fp8_paged_mqa_logits_triton(
+                    padded_q_quant_cast,
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens,
+                    decode_metadata.block_table,
+                    max_model_len=attn_metadata_narrowed.max_seq_len,
+                    clean_logits=False,
+                )
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
@@ -440,9 +473,14 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
+        if current_platform.is_cuda() and not is_deep_gemm_supported():
+            if use_fp4_cache:
+                raise RuntimeError(
+                    "Sparse Attention Indexer FP4 cache requires DeepGEMM support."
+                )
+            logger.info_once(
+                "DeepGEMM is unavailable or unsupported on this CUDA device; "
+                "using the Triton FP8 sparse indexer logits fallback."
             )
 
     def forward_native(

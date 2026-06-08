@@ -3,8 +3,21 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.models.deepseek_v4.common.ops.sm80_fp8 import _encode_e4m3fn_sw
+from vllm.utils.deep_gemm import cuda_device_supports_deep_gemm, is_deep_gemm_supported
 from vllm.utils.import_utils import has_cutedsl
+
+
+def _cuda_tensor_without_deep_gemm_arch(tensor: torch.Tensor) -> bool:
+    if not current_platform.is_cuda() or not tensor.is_cuda:
+        return False
+
+    device_id = tensor.device.index
+    if device_id is None:
+        device_id = torch.cuda.current_device()
+    return not cuda_device_supports_deep_gemm(device_id)
 
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
 MXFP4_BLOCK_SIZE = 32
@@ -64,6 +77,80 @@ def _quantize_mxfp4_pair(x_lo, x_hi):
     inv_scale = 1.0 / scale
     packed = _fp32x2_to_fp4x2(x_lo * inv_scale, x_hi * inv_scale)
     return packed, ue8m0
+
+
+@triton.jit
+def _fused_indexer_q_rope_quant_sw_kernel(
+    pos_ptr,
+    index_q_ptr,
+    index_q_stride0,
+    index_q_stride1,
+    index_q_cos_sin_ptr,
+    index_q_cos_sin_stride,
+    INDEX_Q_HALF_ROT_DIM: tl.constexpr,
+    index_q_u8_ptr,
+    index_q_u8_stride0,
+    index_q_u8_stride1,
+    INDEX_Q_HEAD_DIM: tl.constexpr,
+    index_weights_ptr,
+    index_weights_stride,
+    index_weights_softmax_scale,
+    index_weights_head_scale,
+    index_weights_out_ptr,
+    index_weights_out_stride,
+):
+    """SM80 variant: uses _encode_e4m3fn_sw instead of tl.float8e4nv."""
+    INDEX_Q_ROT_DIM: tl.constexpr = 2 * INDEX_Q_HALF_ROT_DIM
+    INDEX_Q_NOPE_DIM: tl.constexpr = INDEX_Q_HEAD_DIM - INDEX_Q_ROT_DIM
+    tl.static_assert(INDEX_Q_NOPE_DIM >= 0)
+    tok_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    pos = tl.load(pos_ptr + tok_idx)
+    cos, sin = _get_cos_sin(
+        index_q_cos_sin_ptr, index_q_cos_sin_stride, pos, INDEX_Q_HALF_ROT_DIM
+    )
+    half_offset = tl.arange(0, INDEX_Q_HALF_ROT_DIM)
+    base_ptr = index_q_ptr + tok_idx * index_q_stride0 + head_idx * index_q_stride1
+    rot_base = base_ptr + INDEX_Q_NOPE_DIM
+    x_even = tl.load(rot_base + half_offset * 2).to(tl.float32)
+    x_odd = tl.load(rot_base + half_offset * 2 + 1).to(tl.float32)
+    r_even = x_even * cos - x_odd * sin
+    r_odd = x_odd * cos + x_even * sin
+    r_even = r_even.to(tl.bfloat16).to(tl.float32)
+    r_odd = r_odd.to(tl.bfloat16).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(r_even)), tl.max(tl.abs(r_odd)))
+    if INDEX_Q_NOPE_DIM > 0:
+        nope_offset = tl.arange(0, INDEX_Q_NOPE_DIM)
+        x_nope = tl.load(base_ptr + nope_offset).to(tl.float32)
+        amax = tl.maximum(amax, tl.max(tl.abs(x_nope)))
+    index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), 448.0)
+    index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
+    u8_ptr = (
+        index_q_u8_ptr + tok_idx * index_q_u8_stride0 + head_idx * index_q_u8_stride1
+    )
+    if INDEX_Q_NOPE_DIM > 0:
+        tl.store(
+            u8_ptr + nope_offset,
+            _encode_e4m3fn_sw(tl.div_rn(x_nope, index_q_scale)),
+        )
+    u8_rot_base = u8_ptr + INDEX_Q_NOPE_DIM
+    tl.store(
+        u8_rot_base + half_offset * 2,
+        _encode_e4m3fn_sw(tl.div_rn(r_even, index_q_scale)),
+    )
+    tl.store(
+        u8_rot_base + half_offset * 2 + 1,
+        _encode_e4m3fn_sw(tl.div_rn(r_odd, index_q_scale)),
+    )
+    w = tl.load(
+        index_weights_ptr + tok_idx * index_weights_stride + head_idx
+    ).to(tl.float32)
+    qs = index_q_scale
+    result = w * qs * index_weights_softmax_scale * index_weights_head_scale
+    tl.store(
+        index_weights_out_ptr + tok_idx * index_weights_out_stride + head_idx,
+        result,
+    )
 
 
 @triton.jit
@@ -290,6 +377,7 @@ def fused_indexer_q_rope_quant(
     index_weights_softmax_scale: float,
     index_weights_head_scale: float,
     use_fp4: bool = False,
+    cuda_without_deep_gemm: bool | None = None,
 ) -> tuple[
     torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     torch.Tensor,
@@ -328,7 +416,45 @@ def fused_indexer_q_rope_quant(
 
     index_weights_out = torch.empty_like(index_weights, dtype=torch.float32)
 
+    cuda_without_deep_gemm_arch = _cuda_tensor_without_deep_gemm_arch(index_q)
+    if cuda_without_deep_gemm is None:
+        cuda_without_deep_gemm = (
+            current_platform.is_cuda() and not is_deep_gemm_supported()
+        )
+    cuda_without_deep_gemm = cuda_without_deep_gemm or cuda_without_deep_gemm_arch
+    if not use_fp4 and cuda_without_deep_gemm:
+        index_q_fp8_u8 = torch.empty(
+            (num_tokens, num_index_q_heads, index_q_head_dim),
+            dtype=torch.uint8,
+            device=index_q.device,
+        )
+        _fused_indexer_q_rope_quant_sw_kernel[(num_tokens, num_index_q_heads)](
+            positions,
+            index_q,
+            index_q.stride(0),
+            index_q.stride(1),
+            index_q_cos_sin_cache,
+            index_q_cos_sin_cache.stride(0),
+            index_q_cos_sin_cache.shape[-1] // 2,
+            index_q_fp8_u8,
+            index_q_fp8_u8.stride(0),
+            index_q_fp8_u8.stride(1),
+            index_q_head_dim,
+            index_weights,
+            index_weights.stride(0),
+            index_weights_softmax_scale,
+            index_weights_head_scale,
+            index_weights_out,
+            index_weights_out.stride(0),
+            num_warps=1,
+        )
+        return index_q_fp8_u8, index_weights_out
+
     if use_fp4:
+        if cuda_without_deep_gemm:
+            raise RuntimeError(
+                "DeepSeek V4 MXFP4 indexer Q requires DeepGEMM support on CUDA."
+            )
         assert index_q_head_dim % MXFP4_BLOCK_SIZE == 0, (
             f"head_dim={index_q_head_dim} must be a multiple of MXFP4 block "
             f"size {MXFP4_BLOCK_SIZE}"

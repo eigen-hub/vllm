@@ -103,10 +103,20 @@ def get_attn_backend(
         use_kv_connector=use_kv_connector,
     )
 
+    device_id = None
+    try:
+        from vllm.platforms import current_platform
+
+        if current_platform.is_cuda() and torch.cuda.is_available():
+            device_id = torch.cuda.current_device()
+    except Exception:
+        device_id = None
+
     return _cached_get_attn_backend(
         backend=vllm_config.attention_config.backend,
         attn_selector_config=attn_selector_config,
         num_heads=num_heads,
+        device_id=device_id,
     )
 
 
@@ -115,6 +125,7 @@ def _cached_get_attn_backend(
     backend,
     attn_selector_config: AttentionSelectorConfig,
     num_heads: int | None = None,
+    device_id: int | None = None,
 ) -> type[AttentionBackend]:
     from vllm.platforms import current_platform
 
@@ -122,6 +133,7 @@ def _cached_get_attn_backend(
         backend,
         attn_selector_config=attn_selector_config,
         num_heads=num_heads,
+        device_id=device_id,
     )
     if not attention_cls:
         raise ValueError(

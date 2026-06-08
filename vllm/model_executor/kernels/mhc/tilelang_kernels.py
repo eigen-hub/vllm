@@ -27,9 +27,16 @@ else:
 ENABLE_PDL = current_platform.is_arch_support_pdl() and current_platform.is_cuda()
 
 
-@cache
 def compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
-    device_props = torch.cuda.get_device_properties(0)
+    device_id = torch.cuda.current_device()
+    return _compute_num_split(block_k, k, grid_size, device_id)
+
+
+@cache
+def _compute_num_split(
+    block_k: int, k: int | None, grid_size: int, device_id: int
+) -> int:
+    device_props = torch.cuda.get_device_properties(device_id)
     n_sms = device_props.multi_processor_count
     split_k = n_sms // grid_size
     if k is not None:

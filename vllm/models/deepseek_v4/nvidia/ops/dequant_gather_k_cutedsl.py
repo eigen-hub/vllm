@@ -3,15 +3,27 @@
 
 from functools import cache
 
+import torch
+
+# Must import from vllm.cute_utils BEFORE importing cutlass, because
+# vllm.cute_utils/__init__.py monkey-patches detect_gpu_arch() to use the
+# current worker's GPU (instead of hardcoded device_id=0) BEFORE any
+# CUTLASS DSL module creates its EnvironmentVarManager.  Without this, all
+# workers compile CUTLASS DSL kernels for GPU 0's architecture, which
+# disables the JIT engine and produces a segfault in TVMFFIFunctionCall.
+from vllm.cute_utils import (
+    _bf16x2_mul,
+    cute_arch_from_device,
+    cute_compile_options,
+    cvt,
+)
+
 import cutlass
 import cutlass.cute as cute
-import torch
 from cuda.bindings.driver import CUstream
 from cutlass import BFloat16, Int32, Uint8, Uint32
 from cutlass.cute.nvgpu import cpasync
 from quack.compile_utils import make_fake_tensor
-
-from vllm.cute_utils import _bf16x2_mul, cvt
 
 
 def dequantize_and_gather_k_cache_cutedsl(
@@ -23,9 +35,11 @@ def dequantize_and_gather_k_cache_cutedsl(
     block_size: int,
     offset: int,
 ) -> None:
+    gpu_arch = cute_arch_from_device(out.device)
     DequantGatherKCacheKernel.compile(
         block_size=block_size,
         has_gather_lens=gather_lens is not None,
+        gpu_arch=gpu_arch,
     )(out, k_cache, seq_lens, gather_lens, block_table, offset)
 
 
@@ -300,6 +314,7 @@ class DequantGatherKCacheKernel:
         fp8_dim: int = 448,
         block_size: int = 64,
         has_gather_lens: bool = True,
+        gpu_arch: str = "",
     ):
         num_reqs = cute.sym_int()
         head_dim = DequantGatherKCacheKernel.head_dim
@@ -327,5 +342,5 @@ class DequantGatherKCacheKernel:
             block_table,
             Int32(0),
             stream,
-            options="--enable-tvm-ffi",
+            options=cute_compile_options(gpu_arch=gpu_arch),
         )

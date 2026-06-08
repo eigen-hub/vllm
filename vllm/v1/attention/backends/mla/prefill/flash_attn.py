@@ -74,7 +74,12 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
         # v with 0s to match the qk head dim for attention backends that do
         # not support different headdims.
         # FA3 on Hopper (SM90) and FA4 natively handle diff headdims.
-        device_capability = current_platform.get_device_capability()
+        device_id = None
+        if current_platform.is_cuda() and torch.cuda.is_available():
+            device_id = torch.cuda.current_device()
+        device_capability = current_platform.get_device_capability(
+            device_id=0 if device_id is None else device_id
+        )
         self.requires_v_padding = self.vllm_flash_attn_version is None or not (
             (
                 self.vllm_flash_attn_version == 3

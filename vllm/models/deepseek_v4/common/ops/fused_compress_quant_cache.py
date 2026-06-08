@@ -24,6 +24,7 @@ from typing import Any
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.models.deepseek_v4.common.ops.sm80_fp8 import _encode_e4m3fn_sw
 
 from .fused_indexer_q import _fp32x2_to_fp4x2
 
@@ -51,6 +52,7 @@ def compress_norm_rope_store_triton(
     quant_block: int,
     token_stride: int,
     scale_dim: int,
+    software_fp8: bool = False,
 ) -> None:
     """Shared triton launcher for the fused compress+norm+RoPE+insert path.
 
@@ -101,6 +103,7 @@ def compress_norm_rope_store_triton(
         TOKEN_STRIDE=token_stride,
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
+        **({} if use_fp4_cache else {"SOFTWARE_FP8": software_fp8}),
         num_warps=num_warps,
         **pdl_kwargs,
     )
@@ -144,6 +147,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     TOKEN_STRIDE: tl.constexpr,  # 576 for DeepseekV4
     SCALE_DIM: tl.constexpr,  # 8 for DeepseekV4 (7 real + 1 pad)
     KV_BLOCK_STRIDE: tl.constexpr,
+    SOFTWARE_FP8: tl.constexpr = False,
 ):
     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
 
@@ -251,9 +255,12 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
     x_scaled = quant_2d * inv_scales_col
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
-    x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
+    if SOFTWARE_FP8:
+        x_uint8_flat = _encode_e4m3fn_sw(tl.reshape(x_clamped, (TRITON_BLOCK_SIZE,)))
+    else:
+        x_fp8 = x_clamped.to(tl.float8e4nv)
+        x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+        x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
 
     nope_mask = block < NOPE_HEAD_DIM
     tl.store(fp8_ptr + block, x_uint8_flat, mask=nope_mask)
@@ -334,6 +341,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
+    SOFTWARE_FP8: tl.constexpr = False,
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
@@ -463,8 +471,11 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
 
     x_scaled = result_bf16 * inv_scale
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+    if SOFTWARE_FP8:
+        x_uint8 = _encode_e4m3fn_sw(x_clamped)
+    else:
+        x_fp8 = x_clamped.to(tl.float8e4nv)
+        x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
 
     tl.store(fp8_ptr + block, x_uint8, mask=mask)
 

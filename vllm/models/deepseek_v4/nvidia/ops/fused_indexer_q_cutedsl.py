@@ -2,19 +2,28 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from functools import cache
 
-import cutlass
-import cutlass.cute as cute
 import torch
-from cuda.bindings.driver import CUstream
-from cutlass import BFloat16, Float32, Int64, Uint8, Uint32, const_expr
-from quack.compile_utils import make_fake_tensor
 
+# Must import from vllm.cute_utils BEFORE importing cutlass, because
+# vllm.cute_utils/__init__.py monkey-patches detect_gpu_arch() to use the
+# current worker's GPU (instead of hardcoded device_id=0) BEFORE any
+# CUTLASS DSL module creates its EnvironmentVarManager.  Without this, all
+# workers compile CUTLASS DSL kernels for GPU 0's architecture, which
+# disables the JIT engine and produces a segfault in TVMFFIFunctionCall.
 from vllm.cute_utils import (
     _bf16x2_abs,
     _bf16x2_max,
+    cute_arch_from_device,
+    cute_compile_options,
     cvt,
     recast_val,
 )
+
+import cutlass
+import cutlass.cute as cute
+from cuda.bindings.driver import CUstream
+from cutlass import BFloat16, Float32, Int64, Uint8, Uint32, const_expr
+from quack.compile_utils import make_fake_tensor
 from vllm.vllm_flash_attn.cute import utils as cute_utils
 
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
@@ -76,13 +85,16 @@ def fused_indexer_q_rope_quant_fp8_cutedsl(
     num_tokens, num_heads, head_dim = index_q.shape
     rope_dim = index_q_cos_sin_cache.shape[-1]
     rope_type = _TORCH_TO_CUTE[index_q_cos_sin_cache.dtype]
+    gpu_arch = cute_arch_from_device(index_q.device)
 
     for coarsen in (1, 4):
-        IndexerQFp8Kernel.compile(head_dim, rope_dim, num_heads, rope_type, coarsen)
+        IndexerQFp8Kernel.compile(
+            head_dim, rope_dim, num_heads, rope_type, coarsen, gpu_arch=gpu_arch
+        )
 
     coarsen = 1 if num_tokens < 512 else 4
     compiled = IndexerQFp8Kernel.compile(
-        head_dim, rope_dim, num_heads, rope_type, coarsen
+        head_dim, rope_dim, num_heads, rope_type, coarsen, gpu_arch=gpu_arch
     )
     scale = float(index_weights_softmax_scale * index_weights_head_scale)
     # The cute kernel treats the FP8 buffer as raw bytes (Uint8).
@@ -571,6 +583,7 @@ class IndexerQFp8Kernel(IndexerQRopeQuantKernel):
         num_heads: int = 64,
         cos_sin_dtype: type[cutlass.Numeric] = Float32,
         coarsen: int = 4,
+        gpu_arch: str = "",
     ):
         num_tokens = cute.sym_int()
         max_pos = cute.sym_int()
@@ -606,5 +619,5 @@ class IndexerQFp8Kernel(IndexerQRopeQuantKernel):
             weights_out,
             Float32(0.0),
             stream,
-            options="--enable-tvm-ffi",
+            options=cute_compile_options(gpu_arch=gpu_arch),
         )

@@ -88,7 +88,9 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major in [9, 10]
+        # DeepSeek V4 dispatches to Triton/reference kernels on SM80 while
+        # using FlashMLA on SM90+ for the attention path.
+        return capability.major in [8, 9, 10]
 
     @staticmethod
     def get_kv_cache_shape(

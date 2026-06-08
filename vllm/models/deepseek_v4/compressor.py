@@ -20,6 +20,7 @@ from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
 from vllm.platforms import current_platform
+from vllm.utils.deep_gemm import current_cuda_device_supports_deep_gemm
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -210,6 +211,9 @@ class DeepseekCompressor(nn.Module):
         self.nope_head_dim = self.head_dim - self.rope_head_dim
         self.rms_norm_eps = config.rms_norm_eps
         self.device = current_platform.device_type
+        self._local_device_supports_optimized_kernels = (
+            current_cuda_device_supports_deep_gemm()
+        )
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_model_len = vllm_config.model_config.max_model_len
 
@@ -353,7 +357,7 @@ class DeepseekCompressor(nn.Module):
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        if current_platform.is_cuda() and self.head_dim == 512 and self._local_device_supports_optimized_kernels:
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
             )
@@ -371,6 +375,8 @@ class DeepseekCompressor(nn.Module):
             # Indexer path (head_dim == 128) or AMD: triton, legacy UE8M0 only.
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
             extra_kwargs = {}
+            if not self.use_fp4_cache and not self._local_device_supports_optimized_kernels:
+                extra_kwargs["software_fp8"] = True
 
         compress_norm_rope_store_fn(
             state_cache=state_cache,

@@ -11,7 +11,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     get_paged_mqa_logits_metadata,
-    has_deep_gemm,
+    is_deep_gemm_supported,
 )
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import num_compute_units
@@ -256,10 +256,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             self.vllm_config.attention_config.use_fp4_indexer_cache
         )
 
-        assert (
-            current_platform.is_device_capability_family(100)
-            or not self.use_fp4_indexer_cache
-        ), (
+        device_id = self.device.index
+        if device_id is None:
+            device_id = torch.cuda.current_device() if current_platform.is_cuda() else 0
+        is_sm100_family = current_platform.is_device_capability_family(
+            100, device_id=device_id
+        )
+
+        assert is_sm100_family or not self.use_fp4_indexer_cache, (
             "use_fp4_indexer_cache requires Blackwell datacenter GPUs "
             "(sm_10x, e.g. B200/GB200); sm_120 (consumer Blackwell) and "
             "earlier architectures are not supported."
@@ -274,10 +278,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # smxx_fp8_fp4_paged_mqa_logits.hpp:233), so flatten there too.
         self.use_flattening = (
             self.use_fp4_indexer_cache
-            or not current_platform.is_device_capability_family(100)
+            or not is_sm100_family
         ) and next_n not in self.natively_supported_next_n_fp4
 
-        sm_count = num_compute_units(self.device.index)
+        sm_count = num_compute_units(device_id)
         self.num_sms = sm_count
 
         self.offsets_buffer = torch.arange(
@@ -609,7 +613,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens = seq_lens.unsqueeze(-1)
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
-            if current_platform.is_cuda() and has_deep_gemm():
+            if current_platform.is_cuda() and is_deep_gemm_supported():
                 self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.storage_block_size,

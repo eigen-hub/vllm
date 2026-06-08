@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import faulthandler
 import multiprocessing
 import os
 import pickle
@@ -273,17 +274,44 @@ class MultiprocExecutor(Executor):
         # logs an error, shuts down the executor and invokes the failure
         # callback to inform the engine.
         def monitor_workers():
-            sentinels = [h.proc.sentinel for h in workers]
-            died = multiprocessing.connection.wait(sentinels)
+            sentinels = {h.proc.sentinel: h for h in workers}
+            died = multiprocessing.connection.wait(list(sentinels))
             _self = self_ref()
             if not _self or getattr(_self, "shutting_down", False):
                 logger.debug("MultiprocWorkerMonitor: shutdown already initiated")
                 return
             _self.is_failed = True
-            proc_name = next(h.proc.name for h in workers if h.proc.sentinel == died[0])
-            logger.error(
-                "Worker proc %s died unexpectedly, shutting down executor.", proc_name
-            )
+
+            def format_exit_status(proc: BaseProcess) -> str:
+                if proc.exitcode is None:
+                    proc.join(timeout=1.0)
+                exitcode = proc.exitcode
+                if exitcode is None:
+                    is_alive = proc.is_alive()
+                    exitcode = proc.exitcode
+                    if exitcode is None:
+                        return f"exitcode=pending after 1.0s (is_alive={is_alive})"
+                if exitcode < 0:
+                    signum = -exitcode
+                    try:
+                        signame = signal.Signals(signum).name
+                    except ValueError:
+                        signame = f"signal {signum}"
+                    return f"exitcode={exitcode} ({signame})"
+                return f"exitcode={exitcode}"
+
+            for sentinel in died:
+                handle = sentinels[sentinel]
+                proc = handle.proc
+                logger.error(
+                    "Worker proc %s (rank=%d, local_rank=%d, pid=%s) died "
+                    "unexpectedly with %s, shutting down executor.",
+                    proc.name,
+                    handle.rank,
+                    handle.local_rank,
+                    proc.pid,
+                    format_exit_status(proc),
+                )
             _self.shutdown()
             callback = _self.failure_callback
             if callback is not None:
@@ -519,6 +547,7 @@ class UnreadyWorkerProcHandle:
 
     proc: BaseProcess
     rank: int
+    local_rank: int
     ready_pipe: Connection
     death_writer: Connection | None = None
 
@@ -527,6 +556,7 @@ class UnreadyWorkerProcHandle:
 class WorkerProcHandle:
     proc: BaseProcess
     rank: int
+    local_rank: int
     # The worker process writes to this MQ in single-node mode
     worker_response_mq: MessageQueue | None
     # This is only non empty on driver node,
@@ -545,6 +575,7 @@ class WorkerProcHandle:
         return cls(
             proc=unready_handle.proc,
             rank=unready_handle.rank,
+            local_rank=unready_handle.local_rank,
             worker_response_mq=worker_response_mq,
             peer_worker_response_mqs=peer_worker_response_mqs,
             death_writer=unready_handle.death_writer,
@@ -706,7 +737,9 @@ class WorkerProc:
         death_reader.close()
         # Keep death_writer open in parent - when parent exits,
         # death_reader in child will get EOFError
-        return UnreadyWorkerProcHandle(proc, rank, ready_reader, death_writer)
+        return UnreadyWorkerProcHandle(
+            proc, rank, local_rank, ready_reader, death_writer
+        )
 
     @staticmethod
     def wait_for_response_handle_ready(
@@ -807,6 +840,11 @@ class WorkerProc:
     def worker_main(*args, **kwargs):
         """Worker initialization and execution loops.
         This runs a background process"""
+
+        try:
+            faulthandler.enable(all_threads=True)
+        except Exception:
+            logger.debug("Unable to enable Python faulthandler.", exc_info=True)
 
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker

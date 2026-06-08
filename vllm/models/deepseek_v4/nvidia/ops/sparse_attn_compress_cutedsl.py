@@ -10,9 +10,18 @@ from __future__ import annotations
 from functools import cache
 from typing import Any
 
+import torch
+
+# Must import from vllm.cute_utils BEFORE importing cutlass, because
+# vllm.cute_utils/__init__.py monkey-patches detect_gpu_arch() to use the
+# current worker's GPU (instead of hardcoded device_id=0) BEFORE any
+# CUTLASS DSL module creates its EnvironmentVarManager.  Without this, all
+# workers compile CUTLASS DSL kernels for GPU 0's architecture, which
+# disables the JIT engine and produces a segfault in TVMFFIFunctionCall.
+from vllm.cute_utils import cute_arch_from_device, cute_compile_options
+
 import cutlass
 import cutlass.cute as cute
-import torch
 from cuda.bindings.driver import CUstream
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint16, Uint32, const_expr
 from cutlass._mlir.dialects import llvm
@@ -504,7 +513,7 @@ class SparseAttnCompressNormRopeStoreC4Kernel:
             kv_slot_mapping,
             Int64(0),
             stream,
-            options="--enable-tvm-ffi",
+            options=cute_compile_options(gpu_arch=cute_arch_from_device()),
         )
 
 
@@ -924,7 +933,7 @@ class SparseAttnCompressNormRopeStoreFullC4Kernel(
             Int64(0),
             fp8_scale,
             stream,
-            options="--enable-tvm-ffi",
+            options=cute_compile_options(gpu_arch=cute_arch_from_device()),
         )
 
 
@@ -1238,7 +1247,7 @@ class SparseAttnCompressC128Block8Kernel:
             block_table,
             compressed_kv,
             stream,
-            options="--enable-tvm-ffi",
+            options=cute_compile_options(gpu_arch=cute_arch_from_device()),
         )
 
 
@@ -1525,7 +1534,7 @@ class SparseAttnNormRopeStoreKernel:
             k_cache,
             kv_slot_mapping,
             stream,
-            options="--enable-tvm-ffi",
+            options=cute_compile_options(gpu_arch=cute_arch_from_device()),
         )
 
 
@@ -1792,7 +1801,7 @@ class SparseAttnNormRopeStoreFullKernel:
             Int64(0),
             fp8_scale,
             stream,
-            options="--enable-tvm-ffi",
+            options=cute_compile_options(gpu_arch=cute_arch_from_device()),
         )
 
 

@@ -6,6 +6,7 @@ import torch
 # import vllm.model_executor.kernels.mhc  # noqa: F401
 import vllm.model_executor.kernels.mhc as mhc_kernels
 from vllm.model_executor.custom_op import CustomOp
+from vllm.utils.deep_gemm import use_dsv4_reference_kernels_current_device
 from vllm.utils.import_utils import has_tilelang
 
 HAS_TILELANG = has_tilelang()
@@ -26,6 +27,10 @@ class MHCPreOp(CustomOp):
     def enabled(cls) -> bool:
         return True
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._use_reference_kernels = use_dsv4_reference_kernels_current_device()
+
     def forward_cuda(
         self,
         residual: torch.Tensor,
@@ -41,6 +46,39 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._use_reference_kernels:
+            # SM80 fallback: use PyTorch matmul + Triton fused kernel
+            outer_shape = residual.shape[:-2]
+            hc_mult = residual.shape[-2]
+            hidden_size = residual.shape[-1]
+            num_tokens = residual.view(-1, hc_mult, hidden_size).shape[0]
+            x = residual.view(num_tokens, hc_mult * hidden_size).to(torch.float32)
+            mixes = torch.matmul(x, fn.t())
+            post_mix, comb_mix, layer_input = mhc_kernels.mhc_pre_triton(
+                mixes.contiguous(),
+                residual.contiguous().view(num_tokens, hc_mult * hidden_size),
+                hc_scale,
+                hc_base,
+                rms_eps=rms_eps,
+                hc_pre_eps=hc_pre_eps,
+                hc_sinkhorn_eps=hc_sinkhorn_eps,
+                hc_post_mult_value=hc_post_mult_value,
+                sinkhorn_iters=sinkhorn_repeat,
+                hc=hc_mult,
+                h=hidden_size,
+            )
+            if norm_weight is not None:
+                layer_input = torch.nn.functional.rms_norm(
+                    layer_input,
+                    (layer_input.shape[-1],),
+                    weight=norm_weight,
+                    eps=norm_eps,
+                )
+            return (
+                post_mix.view(*outer_shape, hc_mult, 1),
+                comb_mix.view(*outer_shape, hc_mult, hc_mult),
+                layer_input.view(*outer_shape, hidden_size),
+            )
         return torch.ops.vllm.mhc_pre_tilelang(
             residual,
             fn,
@@ -163,6 +201,10 @@ class MHCPostOp(CustomOp):
     def enabled(cls) -> bool:
         return True
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._use_reference_kernels = use_dsv4_reference_kernels_current_device()
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -170,6 +212,14 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
+        if self._use_reference_kernels:
+            # SM80 fallback: use Triton kernel instead of TileLang
+            return mhc_kernels.mhc_post_triton(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+            )
         return torch.ops.vllm.mhc_post_tilelang(
             x, residual, post_layer_mix, comb_res_mix
         )
@@ -231,6 +281,10 @@ class HCHeadOp(CustomOp):
     def enabled(cls) -> bool:
         return True
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._use_reference_kernels = use_dsv4_reference_kernels_current_device()
+
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,
@@ -243,14 +297,33 @@ class HCHeadOp(CustomOp):
         hc_mult, hidden_size = hidden_states.shape[-2:]
         outer_shape = hidden_states.shape[:-2]
         hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
-        out = torch.ops.vllm.hc_head_fused_kernel_tilelang(
-            hs_flat,
-            hc_fn,
-            hc_scale,
-            hc_base,
-            rms_norm_eps,
-            hc_eps,
+        num_tokens = hs_flat.shape[0]
+        out = torch.empty(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
         )
+        if self._use_reference_kernels:
+            # SM80 fallback: use Triton reference kernel instead of
+            # TileLang PDL kernel which requires SM90+
+            torch.ops.vllm.hc_head_triton(
+                hs_flat,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                out,
+                hidden_size,
+                rms_norm_eps,
+                hc_eps,
+                hc_mult,
+            )
+        else:
+            torch.ops.vllm.hc_head_fused_kernel_tilelang(
+                hs_flat,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_norm_eps,
+                hc_eps,
+            ).copy_(out)
         return out.view(*outer_shape, hidden_size)
 
     def forward_hip(
@@ -316,6 +389,10 @@ class MHCFusedPostPreOp(CustomOp):
     def enabled(cls) -> bool:
         return True
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._use_reference_kernels = use_dsv4_reference_kernels_current_device()
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -335,6 +412,45 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._use_reference_kernels:
+            # SM80 fallback: compose post + pre Triton kernels instead of
+            # the fused TileLang kernel which uses DeepGEMM (SM90+ only).
+            outer_shape = residual.shape[:-2]
+            hc_mult = residual.shape[-2]
+            hidden_size = residual.shape[-1]
+            residual_cur = mhc_kernels.mhc_post_triton(
+                x, residual, post_layer_mix, comb_res_mix
+            )
+            r_flat = residual_cur.reshape(-1, hc_mult, hidden_size)
+            num_tokens = r_flat.shape[0]
+            x_flat = r_flat.view(num_tokens, hc_mult * hidden_size).to(torch.float32)
+            mixes = torch.matmul(x_flat, fn.t())
+            post_mix_cur, comb_mix_cur, layer_input_cur = mhc_kernels.mhc_pre_triton(
+                mixes.contiguous(),
+                r_flat.contiguous().view(num_tokens, hc_mult * hidden_size),
+                hc_scale,
+                hc_base,
+                rms_eps=rms_eps,
+                hc_pre_eps=hc_pre_eps,
+                hc_sinkhorn_eps=hc_sinkhorn_eps,
+                hc_post_mult_value=hc_post_mult_value,
+                sinkhorn_iters=sinkhorn_repeat,
+                hc=hc_mult,
+                h=hidden_size,
+            )
+            if norm_weight is not None:
+                layer_input_cur = torch.nn.functional.rms_norm(
+                    layer_input_cur,
+                    (layer_input_cur.shape[-1],),
+                    weight=norm_weight,
+                    eps=norm_eps,
+                )
+            return (
+                residual_cur.view(*outer_shape, hc_mult, hidden_size),
+                post_mix_cur.view(*outer_shape, hc_mult, 1),
+                comb_mix_cur.view(*outer_shape, hc_mult, hc_mult),
+                layer_input_cur.view(*outer_shape, hidden_size),
+            )
         return torch.ops.vllm.mhc_fused_post_pre_tilelang(
             x,
             residual,

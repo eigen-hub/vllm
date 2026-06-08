@@ -29,6 +29,107 @@ _DEEPGEMM_BLACKWELL_EXCLUDED_MODEL_TYPES: set[str] = {
 }
 
 
+def _capability_supports_deep_gemm(capability: Any) -> bool:
+    if capability is None:
+        return False
+
+    return (capability.major == 9 and capability.minor == 0) or (capability.major >= 10)
+
+
+def _current_cuda_device_id() -> int:
+    if not current_platform.is_cuda():
+        return 0
+
+    try:
+        if torch.cuda.is_available():
+            return torch.cuda.current_device()
+    except Exception:
+        logger.debug_once("Unable to query current CUDA device for DeepGEMM support.")
+
+    return 0
+
+
+@functools.cache
+def _cuda_device_capability(device_id: int) -> Any:
+    if not current_platform.is_cuda():
+        return None
+
+    try:
+        return current_platform.get_device_capability(device_id=device_id)
+    except Exception:
+        logger.debug_once(
+            "Unable to query CUDA device capability for DeepGEMM support."
+        )
+        return None
+
+
+def _current_cuda_capability() -> Any:
+    return _cuda_device_capability(_current_cuda_device_id())
+
+
+def _current_cuda_device_supports_deep_gemm() -> bool:
+    """Return whether this worker's CUDA device supports DeepGEMM kernels.
+
+    vLLM workers can see every GPU on the node while each worker is assigned a
+    different local rank. Capability checks must therefore use the current CUDA
+    device instead of visible device 0 or the full visible set. DeepSeek V4
+    synchronizes this local decision across each TP group separately.
+    """
+    if not current_platform.is_cuda():
+        return current_platform.support_deep_gemm()
+
+    capability = _current_cuda_capability()
+    if capability is None:
+        return current_platform.support_deep_gemm()
+
+    if not _capability_supports_deep_gemm(capability):
+        logger.info_once(
+            "DeepGEMM disabled on current CUDA device %d with unsupported "
+            "capability: %s.",
+            _current_cuda_device_id(),
+            capability.as_version_str(),
+        )
+        return False
+
+    return True
+
+
+def cuda_device_supports_deep_gemm(device_id: int) -> bool:
+    """Return whether the specified CUDA device has a DeepGEMM-capable arch."""
+    if not current_platform.is_cuda():
+        return current_platform.support_deep_gemm()
+
+    capability = _cuda_device_capability(device_id)
+    if capability is None:
+        return current_platform.support_deep_gemm()
+
+    return _capability_supports_deep_gemm(capability)
+
+
+def current_cuda_device_supports_deep_gemm() -> bool:
+    """Return whether the current CUDA device has a DeepGEMM-capable arch.
+
+    This intentionally checks the current worker's assigned device only. It is
+    used by DeepSeek V4 dispatch sites that must avoid compiling SM90+ CUDA or
+    CuteDSL kernels on an SM80 worker even when other workers can use them.
+    """
+    return _current_cuda_device_supports_deep_gemm()
+
+
+def is_deep_gemm_supported_on_current_device() -> bool:
+    """Return whether DeepGEMM can run on this current device.
+
+    Unlike ``use_dsv4_reference_kernels()``, this is not synchronized across a
+    TP group. Heterogeneous deployments need this local answer so A100 workers
+    fall back while H100 workers can still use optimized kernels.
+    """
+    return (
+        envs.VLLM_USE_DEEP_GEMM
+        and has_deep_gemm()
+        and _current_cuda_device_supports_deep_gemm()
+    )
+
+
 def should_auto_disable_deep_gemm(model_type: str | None) -> bool:
     """Check if DeepGemm should be auto-disabled for this model on Blackwell.
 
@@ -37,7 +138,9 @@ def should_auto_disable_deep_gemm(model_type: str | None) -> bool:
     """
     if model_type is None:
         return False
-    if not current_platform.is_device_capability_family(100):
+    if not current_platform.is_device_capability_family(
+        100, device_id=_current_cuda_device_id()
+    ):
         return False
     return model_type in _DEEPGEMM_BLACKWELL_EXCLUDED_MODEL_TYPES
 
@@ -71,7 +174,9 @@ class DeepGemmQuantScaleFMT(Enum):
 
         cls._oracle_cache = (  # type: ignore
             cls.UE8M0
-            if current_platform.is_device_capability_family(100)
+            if current_platform.is_device_capability_family(
+                100, device_id=_current_cuda_device_id()
+            )
             else cls.FLOAT32_CEIL_UE8M0
         )
 
@@ -83,13 +188,11 @@ class DeepGemmQuantScaleFMT(Enum):
         return cached
 
 
-@functools.cache
 def is_deep_gemm_supported() -> bool:
     """Return `True` if DeepGEMM is supported on the current platform.
-    Currently, only Hopper and Blackwell GPUs are supported.
+    Currently, only Hopper or Blackwell CUDA devices are supported.
     """
-    is_supported_arch = current_platform.support_deep_gemm()
-    return envs.VLLM_USE_DEEP_GEMM and has_deep_gemm() and is_supported_arch
+    return is_deep_gemm_supported_on_current_device()
 
 
 @functools.cache
@@ -115,6 +218,112 @@ def is_deep_gemm_e8m0_used() -> bool:
 
     logger.info_once("DeepGEMM E8M0 disabled on current configuration.")
     return False
+
+
+def _resolve_use_dsv4_ref_kernels() -> bool:
+    if current_platform.is_rocm():
+        return True
+
+    if not is_deep_gemm_supported_on_current_device():
+        return True
+    try:
+        from vllm.v1.attention.ops.flashmla import is_flashmla_sparse_supported
+
+        is_supported, _ = is_flashmla_sparse_supported()
+        return not is_supported
+    except Exception:
+        return True
+
+
+_USE_DSV4_REF_KERNELS: bool | None = None
+_DSV4_REF_KERNELS_SYNCED: bool = False
+
+
+def sync_dsv4_reference_kernels(use_ref: bool) -> None:
+    """Explicitly synchronize the reference kernel flag across TP ranks.
+
+    In heterogeneous clusters (e.g. H100 + A100), Rank 0 might resolve
+    to False while other ranks resolve to True. This function allows
+    Rank 0's decision (or the group's consensus) to be forced on all ranks.
+    """
+    global _USE_DSV4_REF_KERNELS, _DSV4_REF_KERNELS_SYNCED
+    _USE_DSV4_REF_KERNELS = use_ref
+    _DSV4_REF_KERNELS_SYNCED = True
+    _cuda_device_capability.cache_clear()
+    is_deep_gemm_e8m0_used.cache_clear()
+    if hasattr(DeepGemmQuantScaleFMT, "_oracle_cache"):
+        delattr(DeepGemmQuantScaleFMT, "_oracle_cache")
+
+
+def sync_dsv4_reference_kernels_group() -> None:
+    """Synchronize USE_DSV4_REF_KERNELS across the TP group after distributed init.
+
+    Each worker resolves independently based on its local device.
+    On heterogeneous clusters (e.g. H100 + A100), workers may disagree.
+    This function all-reduces the per-worker decisions to compute the legacy
+    group-wide logical OR. DeepSeek V4 call sites that can safely dispatch
+    locally should use ``use_dsv4_reference_kernels_current_device()`` instead
+    so Hopper/Blackwell workers can keep optimized kernels when SM80 workers
+    need reference kernels.
+
+    Idempotent: safe to call multiple times (no-op after first successful sync).
+
+    Must be called after the TP group is initialized, before any model code
+    dispatches based on USE_DSV4_REF_KERNELS.
+    """
+    global _DSV4_REF_KERNELS_SYNCED
+    if _DSV4_REF_KERNELS_SYNCED:
+        return
+
+    import torch
+
+    from vllm.distributed import get_tp_group
+
+    try:
+        tp_group = get_tp_group()
+    except (AssertionError, RuntimeError):
+        # Distributed group not yet initialized — skip sync, keep local decision.
+        return
+
+    if tp_group.world_size <= 1:
+        # Single GPU — local resolution is authoritative.
+        sync_dsv4_reference_kernels(_resolve_use_dsv4_ref_kernels())
+        return
+
+    # Each worker contributes its local decision based on its OWN current
+    # device. CUDA_VISIBLE_DEVICES may expose mixed architectures, and visible
+    # device 0 is not necessarily this worker's assigned GPU.
+    local_decision = _resolve_use_dsv4_ref_kernels()
+
+    device_type = getattr(current_platform, "device_type", "") or (
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+    local_flag = torch.tensor(
+        [1 if local_decision else 0], device=device_type, dtype=torch.int32
+    )
+    summed = tp_group.all_reduce(local_flag)
+    use_ref = summed.item() > 0
+
+    sync_dsv4_reference_kernels(use_ref)
+
+
+def use_dsv4_reference_kernels() -> bool:
+    """Return True when DeepSeek V4 must avoid DeepGEMM/FlashMLA kernels.
+
+    SM80 can store and move the FP8 cache format, but it cannot run the
+    Hopper/Blackwell-only DeepGEMM and FlashMLA Sparse kernels used by the
+    native DeepSeek V4 path. Lazily resolved on first call; overridden if
+    sync_dsv4_reference_kernels_group() runs later (or before).
+    """
+    global _USE_DSV4_REF_KERNELS
+    if _USE_DSV4_REF_KERNELS is None:
+        _USE_DSV4_REF_KERNELS = _resolve_use_dsv4_ref_kernels()
+    return _USE_DSV4_REF_KERNELS
+
+
+def use_dsv4_reference_kernels_current_device() -> bool:
+    """Return the DeepSeek V4 reference-kernel decision for this device only."""
+    return _resolve_use_dsv4_ref_kernels()
 
 
 def _missing(*_: Any, **__: Any) -> NoReturn:
@@ -581,4 +790,12 @@ __all__ = [
     "should_use_deepgemm_for_fp8_linear",
     "get_col_major_tma_aligned_tensor",
     "get_mk_alignment_for_contiguous_layout",
+    "cuda_device_supports_deep_gemm",
+    "current_cuda_device_supports_deep_gemm",
+    "is_deep_gemm_supported_on_current_device",
+    "should_auto_disable_deep_gemm",
+    "use_dsv4_reference_kernels",
+    "use_dsv4_reference_kernels_current_device",
+    "sync_dsv4_reference_kernels",
+    "sync_dsv4_reference_kernels_group",
 ]

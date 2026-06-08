@@ -92,7 +92,12 @@ def get_mla_prefill_backend(
     """
     from vllm.platforms import current_platform
 
-    device_capability = current_platform.get_device_capability()
+    device_id = None
+    if current_platform.is_cuda() and torch.cuda.is_available():
+        device_id = torch.cuda.current_device()
+    device_capability = current_platform.get_device_capability(
+        device_id=0 if device_id is None else device_id
+    )
     if device_capability is None:
         logger.info_once(
             "Device capability not available, using FlashAttention MLA prefill backend."

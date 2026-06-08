@@ -127,7 +127,9 @@ class FlashMLASparseBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major in [9, 10]
+        # DeepSeek V4 dispatches to Triton/reference kernels on SM80 while
+        # reusing this metadata/cache layout backend.
+        return capability.major in [8, 9, 10]
 
     @staticmethod
     def get_kv_cache_shape(
@@ -251,7 +253,13 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         # prefill.
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
-        sm_count = num_compute_units(device.index)
+        device_id = device.index
+        if device_id is None:
+            device_id = torch.cuda.current_device() if current_platform.is_cuda() else 0
+        sm_count = num_compute_units(device_id)
+        is_sm100_family = current_platform.is_device_capability_family(
+            100, device_id=device_id
+        )
 
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.mla_dims = get_mla_dims(self.model_config)
@@ -287,7 +295,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         # For max buffer size, use s_q = 1 (the case that produces largest output)
         # Use padded head count since that's what will be passed to the kernel
         h_q = self.fp8_decode_padded_heads
-        if current_platform.is_device_capability_family(100):
+        if is_sm100_family:
             # SM100 head64 or head64x2 uses full SM count
             max_num_sm_parts = sm_count
         else:
@@ -571,8 +579,11 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         assert indexer is not None
         self.topk_indices_buffer: torch.Tensor | None = indexer.topk_indices_buffer
         # Prefill BF16 kernel requires 64 on Hopper, 128 on Blackwell
+        device_id = torch.cuda.current_device() if current_platform.is_cuda() else 0
         self.prefill_padding = (
-            128 if current_platform.is_device_capability_family(100) else 64
+            128
+            if current_platform.is_device_capability_family(100, device_id=device_id)
+            else 64
         )
         self.fp8_decode_padded_heads = self._compute_fp8_decode_padded_heads(num_heads)
 

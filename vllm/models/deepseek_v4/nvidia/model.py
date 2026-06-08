@@ -61,6 +61,7 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.sequence import IntermediateTensors
+from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
@@ -487,6 +488,11 @@ class DeepseekV4MoE(nn.Module):
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
+        # DeepGEMM MegaMoE requires SM100+ GPUs.
+        if self.use_mega_moe and not current_platform.is_device_capability_family(
+            100, device_id=torch.cuda.current_device()
+        ):
+            self.use_mega_moe = False
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently requires expert parallel. "
@@ -885,6 +891,11 @@ class DeepseekV4Model(nn.Module):
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
+        # DeepGEMM MegaMoE requires SM100+ GPUs.
+        if self.use_mega_moe and not current_platform.is_device_capability_family(
+            100, device_id=torch.cuda.current_device()
+        ):
+            self.use_mega_moe = False
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently requires expert parallel. "

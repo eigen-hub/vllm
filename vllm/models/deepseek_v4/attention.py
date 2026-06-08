@@ -26,6 +26,8 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
     fused_q_kv_rmsnorm,
 )
+from vllm.platforms import current_platform
+from vllm.utils.deep_gemm import is_deep_gemm_supported, use_dsv4_reference_kernels_current_device
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -218,8 +220,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             return_bias=False,
             prefix=f"{prefix}.wo_a",
         )
-        self.wo_a.is_bmm = True
-        self.wo_a.bmm_batch_size = self.n_local_groups
+        self.wo_a.is_bmm = not use_dsv4_reference_kernels_current_device()
+        self.wo_a.bmm_batch_size = self.n_local_groups if self.wo_a.is_bmm else 0
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -438,6 +440,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
+        # For SM80, reference kernels don't need padded heads.
+        q_output_heads = getattr(self, "_use_reference_kernels", False) and self.n_local_heads or self.padded_heads
+
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (forward_mqa
         # downstream reads q on default). Indexer/compressor go on aux for
@@ -451,7 +456,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
             def wq_b_kv_insert() -> torch.Tensor:
                 q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+                q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata, q_output_heads)
                 return q
 
             # 3-way overlap (matches TRT-LLM PR #14142 Level 1): default runs
@@ -485,7 +490,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
             def wq_b_kv_insert() -> torch.Tensor:
                 q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+                q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata, q_output_heads)
                 return q
 
             q, _ = maybe_execute_in_parallel(
@@ -498,11 +503,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         else:
             # SWA-only layer: no compressor, no overlap.
             q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-            q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+            q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata, q_output_heads)
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
-        self.forward_mqa(q, kv, positions, out)
+        attn_out = out[:, :q_output_heads, :] if getattr(self, "_use_reference_kernels", False) else out
+        self.forward_mqa(q, kv, positions, attn_out)
 
     def _fused_qnorm_rope_kv_insert(
         self,
@@ -512,14 +518,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         attn_metadata: (
             dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None
         ),
+        q_output_heads: int | None = None,
     ) -> torch.Tensor:
+        if q_output_heads is None:
+            q_output_heads = self.padded_heads
         if not isinstance(attn_metadata, dict):
             # Profile run: kernel doesn't fire; produce a padded tensor so
             # downstream FlashMLA gets the right shape.
-            if self.n_local_heads < self.padded_heads:
+            if self.n_local_heads < q_output_heads:
                 return F.pad(
                     q,
-                    (0, 0, 0, self.padded_heads - self.n_local_heads),
+                    (0, 0, 0, q_output_heads - self.n_local_heads),
                     value=0.0,
                 )
             return q
@@ -552,7 +561,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 swa_metadata.slot_mapping,
                 positions,
                 cos_sin_cache,
-                self.padded_heads,
+                q_output_heads,
                 self.eps,
                 swa_metadata.block_size,
             )
@@ -688,6 +697,9 @@ class DeepseekV4Indexer(nn.Module):
             "Using %s indexer cache for Lightning Indexer.",
             "MXFP4" if self.use_fp4_kv else "FP8",
         )
+        self._cuda_without_deep_gemm = (
+            current_platform.is_cuda() and not is_deep_gemm_supported()
+        )
 
         # no tensor parallel, just replicated
         self.wq_b = ReplicatedLinear(
@@ -786,6 +798,7 @@ class DeepseekV4Indexer(nn.Module):
                 self.softmax_scale,
                 self.n_head**-0.5,
                 use_fp4=self.use_fp4_kv,
+                cuda_without_deep_gemm=self._cuda_without_deep_gemm,
             )
 
         # compressor returns None and writes K to the indexer KV cache; the

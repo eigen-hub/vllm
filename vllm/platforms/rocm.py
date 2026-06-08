@@ -515,6 +515,7 @@ class RocmPlatform(Platform):
         selected_backend: "AttentionBackendEnum",
         attn_selector_config: "AttentionSelectorConfig",
         num_heads: int | None = None,
+        device_id: int | None = None,
     ) -> str:
         device_capability = cls.get_device_capability()
         assert device_capability is not None

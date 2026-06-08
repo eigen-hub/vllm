@@ -133,7 +133,14 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
             vllm_config.cache_config.cache_dtype
         )
 
-        num_sms = num_compute_units(self.device.index)
+        device_id = self.device.index
+        if device_id is None:
+            device_id = (
+                torch.cuda.current_device()
+                if self.device.type == "cuda" and torch.cuda.is_available()
+                else 0
+            )
+        num_sms = num_compute_units(device_id)
 
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.cg_buf_tile_scheduler_metadata = torch.zeros(

@@ -68,20 +68,38 @@ class CutlassMLABackend(MLACommonBackend):
 
 class SM100Workspace:
     def __init__(self, initial_workspace_size):
-        self._workspace_buf = torch.empty(
-            initial_workspace_size, device="cuda", dtype=torch.uint8
-        )
-
+        self._initial_workspace_size = initial_workspace_size
+        self._workspace_buf: torch.Tensor | None = None
+        self._device_id: int | None = None
+        self._sm_count = 0
         self._block_size = 128  # Forced to 128
 
-        # Pre-compute sm_count to avoid recomputing it. Use device 0 as a proxy
-        # (assumes all devices are similar)
-        self._sm_count = num_compute_units(0)
+    def _ensure_device(self, device: torch.device) -> None:
+        device_id = device.index
+        if device_id is None:
+            device_id = torch.cuda.current_device()
+        if self._workspace_buf is not None and self._device_id == device_id:
+            return
+        self._device_id = device_id
+        self._sm_count = num_compute_units(device_id)
+        self._workspace_buf = torch.empty(
+            self._initial_workspace_size,
+            device=torch.device("cuda", device_id),
+            dtype=torch.uint8,
+        )
 
     def get_buf(self):
+        assert self._workspace_buf is not None
         return self._workspace_buf
 
-    def ensure_size(self, attn_metadata: MLACommonMetadata, num_kv_splits: int):
+    def ensure_size(
+        self,
+        attn_metadata: MLACommonMetadata,
+        num_kv_splits: int,
+        device: torch.device | None = None,
+    ):
+        if device is not None:
+            self._ensure_device(device)
         batch_size = attn_metadata.num_reqs
         max_seq_len = attn_metadata.max_query_len
 
@@ -268,7 +286,9 @@ class CutlassMLAImpl(MLACommonImpl[MLACommonMetadata]):
             )
 
         # Adjust workspace size (if necessary)
-        self._workspace.ensure_size(attn_metadata, self._num_kv_splits)
+        self._workspace.ensure_size(
+            attn_metadata, self._num_kv_splits, q_nope.device
+        )
 
         # Run MLA
         o, lse = self._sm100_cutlass_mla_decode(

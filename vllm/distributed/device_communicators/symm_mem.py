@@ -54,7 +54,10 @@ class SymmMemCommunicator:
         self.device = device
         self.group = group
         self.world_size = dist.get_world_size(self.group)
-        capability = current_platform.get_device_capability()
+        device_id = device.index
+        if device_id is None:
+            device_id = torch.cuda.current_device()
+        capability = current_platform.get_device_capability(device_id=device_id)
         if capability is None:
             logger.warning(
                 "SymmMemCommunicator: device capability is unknown, "

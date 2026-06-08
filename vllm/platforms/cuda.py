@@ -295,8 +295,13 @@ class CudaPlatformBase(Platform):
         selected_backend: AttentionBackendEnum | None,
         attn_selector_config: AttentionSelectorConfig,
         num_heads: int | None = None,
+        device_id: int | None = None,
     ) -> str:
-        device_capability = cls.get_device_capability()
+        if device_id is None and torch.cuda.is_available():
+            device_id = torch.cuda.current_device()
+        device_capability = cls.get_device_capability(
+            device_id=0 if device_id is None else device_id
+        )
         assert device_capability is not None
 
         # First try checking just the selected backend, if there is one.

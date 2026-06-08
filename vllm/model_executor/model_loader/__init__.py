@@ -140,6 +140,23 @@ def get_model(
     loader = get_model_loader(load_config or vllm_config.load_config)
     if model_config is None:
         model_config = vllm_config.model_config
+
+    # Synchronize the legacy group-wide DeepSeek V4 reference-kernel flag
+    # before model construction. Dispatch sites that can safely mix optimized
+    # and reference kernels use the current-device helper directly, which lets
+    # SM80 ranks fall back without dragging SM90+ ranks off optimized kernels.
+    is_dsv4 = False
+    if model_config.hf_config is not None:
+        archs = getattr(model_config.hf_config, "architectures", None) or []
+        is_dsv4 = any("DeepseekV4" in arch for arch in archs)
+    if not is_dsv4 and model_config.model is not None:
+        model_name = model_config.model.lower()
+        is_dsv4 = "deepseek" in model_name and "v4" in model_name
+    if is_dsv4:
+        from vllm.utils.deep_gemm import sync_dsv4_reference_kernels_group
+
+        sync_dsv4_reference_kernels_group()
+
     return loader.load_model(
         vllm_config=vllm_config, model_config=model_config, prefix=prefix
     )
